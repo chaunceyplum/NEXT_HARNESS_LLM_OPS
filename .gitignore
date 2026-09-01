@@ -1,0 +1,15 @@
+# dependencies
+/node_modules
+
+# testing
+/coverage
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.local.example
+
+# typescript
+*.tsbuildinfo
+
+# misc
+.DS_Store
