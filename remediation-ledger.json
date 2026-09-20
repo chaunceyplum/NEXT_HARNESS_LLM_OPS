@@ -1,1 +1,34 @@
-{}
+{
+  "opt::model-fallback-circuit-breaker": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "bedrock:balanced::provider_access": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "bedrock:cheap::provider_access": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "bedrock:expensive::provider_access": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "anthropic:haiku::provider_auth": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "anthropic:opus::provider_auth": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "anthropic:haiku::provider_quota": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "anthropic:opus::provider_quota": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
+    "remediatedAt": "2026-09-20T16:32:00.000Z"
+  }
+}

@@ -7,7 +7,7 @@ name: LLM-Ops
 # Required repository secrets:
 #   MCP_ENDPOINT_URL    - same MCP endpoint NEXT_HARNESS uses (for live data)
 #   MCP_API_KEY         - optional, if the MCP API Gateway stage enforces auth
-#   ANTHROPIC_API_KEY   - auth for the headless `claude` CLI (remediate only)
+#   ANTHROPIC_API_KEY   - drives the in-process remediation engine (remediate only)
 #   GH_PAT              - PAT with push + pull-request rights on the target repo
 # Optional repository variables (Settings -> Variables):
 #   TARGET_REPO         - owner/name of the repo to fix (default: chaunceyplum/NEXT_HARNESS)
@@ -93,8 +93,8 @@ jobs:
         working-directory: ops
         run: npm ci
 
-      - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+      # No external CLI to install: the default in-process remediation engine
+      # talks directly to the Anthropic API using ANTHROPIC_API_KEY below.
 
       - name: Prepare target branch
         working-directory: target
