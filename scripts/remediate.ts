@@ -10,17 +10,24 @@
  * Steps:
  * 1. Load new/unresolved findings (live from harness_agent_runs by default,
  *    or from a pre-fetched JSON file via --seed) and pending optimizations.
- * 2. If there are any, drive a single headless `claude -p` subprocess against
- *    a local target-repo checkout with all of them as its task — it
- *    investigates, changes, adds tests, and commits locally. It does NOT push
- *    or open the PR itself; this script owns that so it's deterministic.
+ * 2. If there are any, drive a coding agent against a local target-repo
+ *    checkout with all of them as its task — it investigates, changes, adds
+ *    tests, and commits locally. It does NOT push or open the PR itself; this
+ *    script owns that so it's deterministic.
+ *
+ *    By default this uses the SELF-CONTAINED in-process engine
+ *    (lib/remediation-engine.ts), which talks directly to the Anthropic API
+ *    and needs only an ANTHROPIC_API_KEY — no external CLI to install. Pass
+ *    `--engine claude-cli` (or REMEDIATE_ENGINE=claude-cli) to instead shell
+ *    out to a `claude -p` process, for hosts that prefer it.
  * 3. Push the branch and open (or reuse) a pull request via the GitHub REST API.
  * 4. Optionally merge the PR (--auto-merge / REMEDIATE_AUTO_MERGE=1). Off by
  *    default: this pipeline opens PRs for review; merging is opt-in.
  * 5. Record every shipped work-item signature -> PR url in remediation-ledger.json.
  *
- * Only needs `claude` on PATH, git, and a GITHUB_TOKEN with push/PR rights
- * (and, for --auto-merge, permission to merge).
+ * Needs git, a GITHUB_TOKEN with push/PR rights (and merge rights for
+ * --auto-merge), and either an ANTHROPIC_API_KEY (default engine) or `claude`
+ * on PATH (--engine claude-cli).
  */
 
 import { execFileSync } from 'node:child_process';
@@ -44,6 +51,9 @@ import {
   type Optimization,
 } from '../lib/optimizations';
 import { fetchFailedRuns, type FailedRun } from '../lib/runs-repository';
+import { runRemediationEngine } from '../lib/remediation-engine';
+
+type Engine = 'in-process' | 'claude-cli';
 
 interface Options {
   seedPath?: string;
@@ -55,6 +65,7 @@ interface Options {
   dryRun: boolean;
   autoMerge: boolean;
   mergeMethod: 'squash' | 'merge' | 'rebase';
+  engine: Engine;
 }
 
 /** A unit of work handed to the agent — either a diagnosed failure or a backlog optimization. */
@@ -74,6 +85,7 @@ function parseArgs(argv: string[]): Options {
     dryRun: false,
     autoMerge: process.env.REMEDIATE_AUTO_MERGE === '1',
     mergeMethod: (process.env.REMEDIATE_MERGE_METHOD as Options['mergeMethod']) || 'squash',
+    engine: (process.env.REMEDIATE_ENGINE as Engine) || 'in-process',
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -85,6 +97,7 @@ function parseArgs(argv: string[]): Options {
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--auto-merge') opts.autoMerge = true;
     else if (arg === '--merge-method') opts.mergeMethod = argv[++i] as Options['mergeMethod'];
+    else if (arg === '--engine') opts.engine = argv[++i] as Engine;
   }
   return opts;
 }
@@ -155,17 +168,15 @@ function buildPrompt(findings: Finding[], optimizations: Optimization[]): string
   return lines.join('\n');
 }
 
-// Tools the headless agent actually needs to investigate, change, test, and
-// commit. Deliberately an allowlist (`--allowed-tools`) rather than
+// Tools the external `claude` CLI (the --engine claude-cli fallback) is
+// granted. Deliberately an allowlist (`--allowed-tools`) rather than
 // `--permission-mode bypassPermissions`/`--dangerously-skip-permissions`:
 // those disable the whole permission system, which Claude Code refuses to do
 // for a process running as root (a real safeguard, not something to work
-// around) — this repo is meant to run as a non-root deploy user or a CI
-// runner (see docs/RUNBOOK.md), where that restriction doesn't apply, but an
-// explicit, minimal allowlist is the better default regardless.
+// around).
 const REQUIRED_TOOLS = 'Read Edit Write Glob Grep Bash';
 
-function runClaudeHeadless(prompt: string, cwd: string, maxBudgetUsd: string): void {
+function runClaudeCli(prompt: string, cwd: string, maxBudgetUsd: string): void {
   execFileSync(
     'claude',
     [
@@ -178,13 +189,31 @@ function runClaudeHeadless(prompt: string, cwd: string, maxBudgetUsd: string): v
   );
 }
 
-/** Claude Code refuses full permission bypasses as root; this script uses an allowlist instead (see REQUIRED_TOOLS), but running as a non-root deploy user / CI runner is still the supported setup — see docs/RUNBOOK.md. */
-function warnIfRoot(): void {
-  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+/**
+ * Drive the selected coding agent against the target checkout. The default
+ * in-process engine (lib/remediation-engine.ts) needs only an
+ * ANTHROPIC_API_KEY and no external binary — it is what makes autonomous
+ * end-to-end runs actually possible. `--engine claude-cli` keeps the original
+ * subprocess path for hosts that prefer it.
+ */
+async function runAgent(prompt: string, opts: Options): Promise<void> {
+  if (opts.engine === 'claude-cli') {
+    console.log('Engine: claude-cli (external subprocess).');
+    runClaudeCli(prompt, opts.repoPath, opts.maxBudgetUsd);
+    return;
+  }
+  console.log('Engine: in-process (Anthropic API, no external CLI).');
+  const result = await runRemediationEngine({ repoPath: opts.repoPath, prompt });
+  console.log(`Engine finished in ${result.steps} step(s); wrote ${result.filesWritten.length} file(s).`);
+  if (result.finalText) console.log(`\nEngine summary:\n${result.finalText}\n`);
+}
+
+/** The in-process engine runs fine as root; only the claude-cli fallback trips Claude Code's root safeguards. */
+function warnIfRoot(engine: Engine): void {
+  if (engine === 'claude-cli' && typeof process.getuid === 'function' && process.getuid() === 0) {
     console.warn(
-      'Warning: running as root (uid 0). This should still work with the --allowed-tools allowlist this ' +
-        'script uses, but the supported setup is a non-root deploy user (see docs/RUNBOOK.md) — some Claude ' +
-        'Code permission modes are refused outright for root processes.'
+      'Warning: running the claude-cli engine as root (uid 0) — some Claude Code permission modes are refused ' +
+        'outright for root processes (see docs/RUNBOOK.md). The default in-process engine has no such restriction.'
     );
   }
 }
@@ -337,7 +366,7 @@ async function main() {
   const prompt = buildPrompt(unresolvedFindings, pendingOpts);
 
   if (opts.dryRun) {
-    console.log('\n--dry-run: would send this prompt to `claude -p` and stop here:\n');
+    console.log(`\n--dry-run: would drive the "${opts.engine}" engine with this prompt and stop here:\n`);
     console.log(prompt);
     return;
   }
@@ -346,12 +375,12 @@ async function main() {
     throw new Error(`Target repo checkout not found at ${opts.repoPath} (set --repo or NEXT_HARNESS_PATH).`);
   }
 
-  warnIfRoot();
+  warnIfRoot(opts.engine);
   assertCleanCheckout(opts.repoPath, opts.branch);
-  runClaudeHeadless(prompt, opts.repoPath, opts.maxBudgetUsd);
+  await runAgent(prompt, opts);
 
   if (!hasNewCommits(opts.repoPath, opts.branch)) {
-    throw new Error('claude finished but left no new commits and no uncommitted changes — nothing to push.');
+    throw new Error('The coding agent finished but left no new commits and no uncommitted changes — nothing to push.');
   }
 
   gitPush(opts.repoPath, opts.branch);

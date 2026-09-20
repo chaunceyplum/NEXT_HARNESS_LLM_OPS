@@ -40,12 +40,32 @@ by someone running ad hoc SQL.
    optimizations, and ledger status as markdown. Run it any time to see the
    health picture.
 5. **Remediate** — for each new/unremediated finding *and* each pending
-   optimization (see below), a Claude coding agent is driven against the
+   optimization (see below), a coding agent is driven against the
    NEXT_HARNESS repo with the work item as its task: make the change, open a
    PR, and update the ledger with the PR link. By default it opens PRs for
    review and stops there; auto-merge is opt-in (`--auto-merge`). This step is
    dispatched by whatever runs the pipeline — a human-driven session, or the
    scheduled GitHub Actions workflow (see below).
+
+## The remediation engine (autonomous, no external CLI)
+
+The fix step runs a **self-contained, in-process engine**
+(`lib/remediation-engine.ts`): an agentic tool-use loop that talks directly to
+the Anthropic API and edits a local NEXT_HARNESS checkout through a small,
+sandboxed tool set (read/write files, list dirs, run the repo's own
+tests/lint/git — all confined to the repo root). It needs only an
+`ANTHROPIC_API_KEY` — **no external `claude` CLI to install**, which is what
+lets it run fully autonomously in CI or on any host.
+
+Engine selection:
+
+- `--engine in-process` (default) — the built-in engine described above.
+- `--engine claude-cli` — shell out to a `claude -p` subprocess instead, for
+  hosts that prefer it. (`REMEDIATE_ENGINE` sets the default.)
+
+The engine only edits and commits; pushing, opening the PR, and the optional
+merge are always owned by `scripts/remediate.ts` so they stay deterministic
+and auditable.
 
 ## Two kinds of work item
 
