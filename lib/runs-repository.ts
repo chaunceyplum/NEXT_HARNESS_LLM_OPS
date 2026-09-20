@@ -5,9 +5,10 @@
  */
 
 import { callMcpTool } from './mcp-client';
+import { loadConfig } from './config';
 import { sqlTimestamp } from './sql';
 
-const TABLE = 'harness_agent_runs';
+const TABLE = loadConfig().runsTable;
 
 interface ExecuteSqlResult {
   rows?: Array<Record<string, unknown>>;

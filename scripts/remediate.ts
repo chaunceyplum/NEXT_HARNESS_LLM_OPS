@@ -1,24 +1,26 @@
 /**
- * `npm run remediate` — the actual fix-and-PR step of the pipeline.
+ * `npm run remediate` — the actual change-and-PR step of the pipeline.
  *
- * 1. Loads new (unremediated) findings — live from harness_agent_runs via
- *    lib/runs-repository.ts by default, or from a pre-fetched JSON file via
- *    --seed (useful where this process has no direct network path to the
- *    MCP endpoint but the data was already pulled through another path).
- * 2. If there are any, drives a single headless `claude -p` subprocess
- *    against a local NEXT_HARNESS checkout with all of them as its task —
- *    it investigates, fixes, adds tests, and commits locally. It does NOT
- *    push or open the PR itself; this script owns that step so it's
- *    deterministic and auditable.
- * 3. Pushes the branch and opens (or reuses, if one's already open from
- *    this branch) a pull request via the GitHub REST API.
- * 4. Records every remediated finding's signature -> PR url in
- *    remediation-ledger.json.
+ * It acts on two kinds of work item, both flowing through the same
+ * agent -> commit -> push -> PR -> ledger machinery:
+ *   1. Failure findings   — auto-diagnosed from harness_agent_runs (reactive).
+ *   2. Optimizations      — a hand-curated backlog under optimizations/ that
+ *                           describes improvements to build (proactive).
  *
- * This script makes the actual change to NEXT_HARNESS — it's not something
- * a human does by hand in a chat session, and it doesn't depend on any
- * Claude-Code-Remote-specific orchestration (session/trigger) tools; it
- * only needs `claude` on PATH, git, and a GITHUB_TOKEN with push/PR rights.
+ * Steps:
+ * 1. Load new/unresolved findings (live from harness_agent_runs by default,
+ *    or from a pre-fetched JSON file via --seed) and pending optimizations.
+ * 2. If there are any, drive a single headless `claude -p` subprocess against
+ *    a local target-repo checkout with all of them as its task — it
+ *    investigates, changes, adds tests, and commits locally. It does NOT push
+ *    or open the PR itself; this script owns that so it's deterministic.
+ * 3. Push the branch and open (or reuse) a pull request via the GitHub REST API.
+ * 4. Optionally merge the PR (--auto-merge / REMEDIATE_AUTO_MERGE=1). Off by
+ *    default: this pipeline opens PRs for review; merging is opt-in.
+ * 5. Record every shipped work-item signature -> PR url in remediation-ledger.json.
+ *
+ * Only needs `claude` on PATH, git, and a GITHUB_TOKEN with push/PR rights
+ * (and, for --auto-merge, permission to merge).
  */
 
 import { execFileSync } from 'node:child_process';
@@ -27,7 +29,20 @@ import { loadEnvLocal } from '../lib/load-env';
 
 loadEnvLocal();
 
-import { buildFindings, loadLedger, newFindings, saveLedger, type Finding } from '../lib/diagnose';
+import { loadConfig } from '../lib/config';
+import {
+  buildFindings,
+  loadLedger,
+  newFindings,
+  saveLedger,
+  type Finding,
+} from '../lib/diagnose';
+import {
+  loadOptimizations,
+  optimizationSignature,
+  pendingOptimizations,
+  type Optimization,
+} from '../lib/optimizations';
 import { fetchFailedRuns, type FailedRun } from '../lib/runs-repository';
 
 interface Options {
@@ -35,17 +50,30 @@ interface Options {
   repoPath: string;
   branch: string;
   base: string;
-  dryRun: boolean;
+  optimizationsDir: string;
   maxBudgetUsd: string;
+  dryRun: boolean;
+  autoMerge: boolean;
+  mergeMethod: 'squash' | 'merge' | 'rebase';
+}
+
+/** A unit of work handed to the agent — either a diagnosed failure or a backlog optimization. */
+interface WorkItem {
+  signature: string;
+  summary: string;
 }
 
 function parseArgs(argv: string[]): Options {
+  const config = loadConfig();
   const opts: Options = {
-    repoPath: process.env.NEXT_HARNESS_PATH || '../NEXT_HARNESS',
-    branch: process.env.NEXT_HARNESS_BRANCH || 'claude/llm-ops-pipeline-plan-23aa8s',
-    base: process.env.NEXT_HARNESS_BASE_BRANCH || 'main',
+    repoPath: config.repoPath,
+    branch: config.branch,
+    base: config.base,
+    optimizationsDir: config.optimizationsDir,
+    maxBudgetUsd: config.maxBudgetUsd,
     dryRun: false,
-    maxBudgetUsd: process.env.REMEDIATE_MAX_BUDGET_USD || '3',
+    autoMerge: process.env.REMEDIATE_AUTO_MERGE === '1',
+    mergeMethod: (process.env.REMEDIATE_MERGE_METHOD as Options['mergeMethod']) || 'squash',
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -53,7 +81,10 @@ function parseArgs(argv: string[]): Options {
     else if (arg === '--repo') opts.repoPath = argv[++i];
     else if (arg === '--branch') opts.branch = argv[++i];
     else if (arg === '--base') opts.base = argv[++i];
+    else if (arg === '--optimizations') opts.optimizationsDir = argv[++i];
     else if (arg === '--dry-run') opts.dryRun = true;
+    else if (arg === '--auto-merge') opts.autoMerge = true;
+    else if (arg === '--merge-method') opts.mergeMethod = argv[++i] as Options['mergeMethod'];
   }
   return opts;
 }
@@ -65,8 +96,8 @@ async function loadFailedRuns(opts: Options): Promise<FailedRun[]> {
   return fetchFailedRuns();
 }
 
-function buildPrompt(findings: Finding[]): string {
-  const sections = findings.map((f) => [
+function findingSection(f: Finding): string {
+  return [
     `### ${f.signature}`,
     `- Model: ${f.model}`,
     `- Category: ${f.category}`,
@@ -74,43 +105,64 @@ function buildPrompt(findings: Finding[]): string {
     `- Sample errors:`,
     ...f.sampleErrors.map((e) => `  - ${e}`),
     `- Suggested fix direction: ${f.suggestedFix}`,
-  ].join('\n'));
+  ].join('\n');
+}
 
+function optimizationSection(o: Optimization): string {
   return [
-    'You are fixing reliability issues in this repo (NEXT_HARNESS) that were diagnosed by the ' +
-      'NEXT_HARNESS_LLM_OPS pipeline reading this app\'s own execution history table (harness_agent_runs). ' +
-      'Each finding below is a real, recurring failure pattern from production runs — not a hypothetical.',
+    `### ${optimizationSignature(o)} — ${o.title}`,
+    `- Priority: ${o.priority}`,
+    `- Rationale: ${o.rationale}`,
+    ...(o.details ? [`- Implementation guidance: ${o.details}`] : []),
+  ].join('\n');
+}
+
+function buildPrompt(findings: Finding[], optimizations: Optimization[]): string {
+  const lines: string[] = [
+    'You are improving the reliability and capability of this repo (the target agent app). Some work items ' +
+      'below are failure patterns diagnosed from the app\'s own execution history table (harness_agent_runs); ' +
+      'others are proactive optimizations from a curated backlog. All are real, intended changes — not hypotheticals.',
     '',
-    'Findings to address:',
-    '',
-    ...sections,
-    '',
+  ];
+
+  if (findings.length > 0) {
+    lines.push('## Failure findings to fix', '');
+    for (const f of findings) lines.push(findingSection(f), '');
+  }
+  if (optimizations.length > 0) {
+    lines.push('## Optimizations to implement', '');
+    for (const o of optimizations) lines.push(optimizationSection(o), '');
+  }
+
+  lines.push(
     'Instructions:',
-    '- Investigate the actual code before changing anything — do not apply a suggested fix blindly if the ' +
-      'real cause turns out to be different once you look.',
-    '- Several findings above likely share one root cause or fix (e.g. multiple provider-error findings across ' +
+    '- Investigate the actual code before changing anything — do not apply a suggested direction blindly if the ' +
+      'real cause or best approach turns out to be different once you look.',
+    '- Several failure findings may share one root cause or fix (e.g. multiple provider-error findings across ' +
       'different models may all be addressed by the same model-health/fallback mechanism) — address the ' +
       'underlying causes with the minimum set of changes, not one patch per finding.',
     '- Where a finding is really an account/infrastructure problem no code change can fix (e.g. missing cloud ' +
       'provider model access), say so in a doc update rather than inventing a code workaround.',
-    '- Add or update tests covering each change, matching this repo\'s existing vitest conventions ' +
-      '(see *.test.ts files next to the modules they test).',
-    '- Run `npm run lint` and `npm run test` and fix any failures before you finish.',
-    '- Commit your changes with a clear, descriptive message (you may make more than one commit).',
+    '- For optimizations, implement the described change scoped to its rationale; if it turns out to be a bad ' +
+      'idea once you see the code, leave a note explaining why rather than forcing it.',
+    '- Add or update tests covering each change, matching this repo\'s existing conventions.',
+    '- Run this repo\'s lint and test commands and fix any failures before you finish.',
+    '- Commit your changes with clear, descriptive messages (you may make more than one commit).',
     '- Do not push and do not open a pull request yourself — the calling script handles that after you finish.',
-    '- Stay scoped to these findings. Do not refactor or fix unrelated things you notice along the way.',
-  ].join('\n');
+    '- Stay scoped to these work items. Do not refactor or fix unrelated things you notice along the way.'
+  );
+
+  return lines.join('\n');
 }
 
-// Tools the headless agent actually needs to investigate, fix, test, and
+// Tools the headless agent actually needs to investigate, change, test, and
 // commit. Deliberately an allowlist (`--allowed-tools`) rather than
 // `--permission-mode bypassPermissions`/`--dangerously-skip-permissions`:
-// those disable the whole permission system, which Claude Code refuses to
-// do for a process running as root (a real safeguard, not something to work
-// around) — this repo is meant to run as a non-root deploy user on EC2
-// (see docs/RUNBOOK.md), where that restriction doesn't even apply, but an
-// explicit, minimal allowlist is the better default regardless of who's
-// running it.
+// those disable the whole permission system, which Claude Code refuses to do
+// for a process running as root (a real safeguard, not something to work
+// around) — this repo is meant to run as a non-root deploy user or a CI
+// runner (see docs/RUNBOOK.md), where that restriction doesn't apply, but an
+// explicit, minimal allowlist is the better default regardless.
 const REQUIRED_TOOLS = 'Read Edit Write Glob Grep Bash';
 
 function runClaudeHeadless(prompt: string, cwd: string, maxBudgetUsd: string): void {
@@ -126,7 +178,7 @@ function runClaudeHeadless(prompt: string, cwd: string, maxBudgetUsd: string): v
   );
 }
 
-/** Claude Code refuses full permission bypasses as root; this script uses an allowlist instead (see REQUIRED_TOOLS), but running as a non-root deploy user is still the supported setup — see docs/RUNBOOK.md. */
+/** Claude Code refuses full permission bypasses as root; this script uses an allowlist instead (see REQUIRED_TOOLS), but running as a non-root deploy user / CI runner is still the supported setup — see docs/RUNBOOK.md. */
 function warnIfRoot(): void {
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     console.warn(
@@ -187,11 +239,16 @@ async function githubRequest(path: string, init: RequestInit = {}): Promise<Resp
   });
 }
 
-async function findOpenPullRequest(owner: string, repo: string, branch: string): Promise<string | null> {
+interface PullRequest {
+  number: number;
+  html_url: string;
+}
+
+async function findOpenPullRequest(owner: string, repo: string, branch: string): Promise<PullRequest | null> {
   const response = await githubRequest(`/repos/${owner}/${repo}/pulls?head=${owner}:${branch}&state=open`);
   if (!response.ok) return null;
-  const data = (await response.json()) as Array<{ html_url: string }>;
-  return data[0]?.html_url ?? null;
+  const data = (await response.json()) as PullRequest[];
+  return data[0] ?? null;
 }
 
 async function openPullRequest(opts: {
@@ -201,7 +258,7 @@ async function openPullRequest(opts: {
   base: string;
   title: string;
   body: string;
-}): Promise<string> {
+}): Promise<PullRequest> {
   const response = await githubRequest(`/repos/${opts.owner}/${opts.repo}/pulls`, {
     method: 'POST',
     body: JSON.stringify({ title: opts.title, head: opts.branch, base: opts.base, body: opts.body }),
@@ -209,42 +266,75 @@ async function openPullRequest(opts: {
   if (!response.ok) {
     throw new Error(`Failed to open PR: HTTP ${response.status} ${await response.text().catch(() => '')}`);
   }
-  const data = (await response.json()) as { html_url: string };
-  return data.html_url;
+  return (await response.json()) as PullRequest;
 }
 
-function prBody(findings: Finding[]): string {
+async function mergePullRequest(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  method: Options['mergeMethod']
+): Promise<void> {
+  const response = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
+    method: 'PUT',
+    body: JSON.stringify({ merge_method: method }),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to merge PR #${prNumber}: HTTP ${response.status} ${await response.text().catch(() => '')} ` +
+        `(branch protection, required checks, or conflicts can block auto-merge — the PR is still open for manual merge).`
+    );
+  }
+}
+
+function prBody(findings: Finding[], optimizations: Optimization[]): string {
   const lines = [
-    'Opened by NEXT_HARNESS_LLM_OPS (`scripts/remediate.ts`) from findings diagnosed against the live ' +
-      '`harness_agent_runs` table.',
-    '',
-    'Findings addressed:',
+    'Opened by NEXT_HARNESS_LLM_OPS (`scripts/remediate.ts`) from work items diagnosed against the live ' +
+      '`harness_agent_runs` table and/or the optimization backlog.',
     '',
   ];
-  for (const f of findings) {
-    lines.push(`- \`${f.signature}\` — ${f.count} occurrence(s), ${f.firstSeen} to ${f.lastSeen}`);
+  if (findings.length > 0) {
+    lines.push('Failure findings addressed:', '');
+    for (const f of findings) {
+      lines.push(`- \`${f.signature}\` — ${f.count} occurrence(s), ${f.firstSeen} to ${f.lastSeen}`);
+    }
+    lines.push('');
   }
-  lines.push('', '---', '_Generated by [Claude Code](https://claude.ai/code)_');
+  if (optimizations.length > 0) {
+    lines.push('Optimizations implemented:', '');
+    for (const o of optimizations) lines.push(`- \`${optimizationSignature(o)}\` — ${o.title}`);
+    lines.push('');
+  }
+  lines.push('---', '_Generated by [Claude Code](https://claude.ai/code)_');
   return lines.join('\n');
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
+  const ledger = loadLedger();
+
   const failedRuns = await loadFailedRuns(opts);
   const findings = buildFindings(failedRuns);
-  const ledger = loadLedger();
-  const unresolved = newFindings(findings, ledger);
+  const unresolvedFindings = newFindings(findings, ledger);
 
-  if (unresolved.length === 0) {
-    console.log('No new findings to remediate.');
+  const optimizations = loadOptimizations(opts.optimizationsDir);
+  const pendingOpts = pendingOptimizations(optimizations, ledger);
+
+  const workItems: WorkItem[] = [
+    ...unresolvedFindings.map((f) => ({ signature: f.signature, summary: `${f.signature} (${f.count} occurrences)` })),
+    ...pendingOpts.map((o) => ({ signature: optimizationSignature(o), summary: `${optimizationSignature(o)} — ${o.title}` })),
+  ];
+
+  if (workItems.length === 0) {
+    console.log('No new findings or pending optimizations to act on.');
     return;
   }
 
-  console.log(`${unresolved.length} new finding(s) to remediate:`);
-  for (const f of unresolved) console.log(`  - ${f.signature} (${f.count} occurrences)`);
+  console.log(`${workItems.length} work item(s) to act on:`);
+  for (const w of workItems) console.log(`  - ${w.summary}`);
 
-  const prompt = buildPrompt(unresolved);
+  const prompt = buildPrompt(unresolvedFindings, pendingOpts);
 
   if (opts.dryRun) {
     console.log('\n--dry-run: would send this prompt to `claude -p` and stop here:\n');
@@ -253,7 +343,7 @@ async function main() {
   }
 
   if (!existsSync(opts.repoPath)) {
-    throw new Error(`NEXT_HARNESS checkout not found at ${opts.repoPath} (set --repo or NEXT_HARNESS_PATH).`);
+    throw new Error(`Target repo checkout not found at ${opts.repoPath} (set --repo or NEXT_HARNESS_PATH).`);
   }
 
   warnIfRoot();
@@ -267,27 +357,32 @@ async function main() {
   gitPush(opts.repoPath, opts.branch);
 
   const { owner, repo } = parseOwnerRepo(opts.repoPath);
-  let prUrl = await findOpenPullRequest(owner, repo, opts.branch);
-  if (!prUrl) {
-    prUrl = await openPullRequest({
+  let pr = await findOpenPullRequest(owner, repo, opts.branch);
+  if (!pr) {
+    pr = await openPullRequest({
       owner,
       repo,
       branch: opts.branch,
       base: opts.base,
-      title: 'Fix reliability issues found in harness_agent_runs',
-      body: prBody(unresolved),
+      title: 'LLM-Ops: fix reliability findings and implement backlog optimizations',
+      body: prBody(unresolvedFindings, pendingOpts),
     });
-    console.log(`Opened PR: ${prUrl}`);
+    console.log(`Opened PR #${pr.number}: ${pr.html_url}`);
   } else {
-    console.log(`Pushed to existing PR: ${prUrl}`);
+    console.log(`Pushed to existing PR #${pr.number}: ${pr.html_url}`);
+  }
+
+  if (opts.autoMerge) {
+    await mergePullRequest(owner, repo, pr.number, opts.mergeMethod);
+    console.log(`Merged PR #${pr.number} (${opts.mergeMethod}).`);
   }
 
   const remediatedAt = new Date().toISOString();
-  for (const finding of unresolved) {
-    ledger[finding.signature] = { prUrl, remediatedAt };
+  for (const item of workItems) {
+    ledger[item.signature] = { prUrl: pr.html_url, remediatedAt };
   }
   saveLedger(ledger);
-  console.log(`Ledger updated with ${unresolved.length} finding(s).`);
+  console.log(`Ledger updated with ${workItems.length} work item(s).`);
 }
 
 main().catch((err) => {

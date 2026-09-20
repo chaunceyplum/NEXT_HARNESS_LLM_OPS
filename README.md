@@ -36,15 +36,39 @@ by someone running ad hoc SQL.
    sample errors), and checks `remediation-ledger.json` to see which
    findings already have a fix PR filed, so the same issue isn't re-reported
    forever.
-4. **Report** — `npm run report` prints the current findings and ledger
-   status as markdown. Run it any time to see the health picture.
-5. **Remediate** — for each new/unremediated finding, a Claude coding agent
-   is driven against the NEXT_HARNESS repo with the finding as its task: fix
-   the root cause, open a PR (never auto-merge — PRs from this pipeline are
-   reviewed like any other), and the ledger gets updated with the PR link.
-   This step doesn't run inside this repo's own process — it's dispatched by
-   whatever is running the pipeline (a human-driven session today; a
-   scheduled Claude Code Remote trigger going forward — see below).
+4. **Report** — `npm run report` prints the current findings, pending
+   optimizations, and ledger status as markdown. Run it any time to see the
+   health picture.
+5. **Remediate** — for each new/unremediated finding *and* each pending
+   optimization (see below), a Claude coding agent is driven against the
+   NEXT_HARNESS repo with the work item as its task: make the change, open a
+   PR, and update the ledger with the PR link. By default it opens PRs for
+   review and stops there; auto-merge is opt-in (`--auto-merge`). This step is
+   dispatched by whatever runs the pipeline — a human-driven session, or the
+   scheduled GitHub Actions workflow (see below).
+
+## Two kinds of work item
+
+This pipeline acts on two inputs, both flowing through the same
+agent → commit → push → PR → ledger machinery:
+
+- **Failure findings** (reactive) — auto-diagnosed from `harness_agent_runs`,
+  as described above.
+- **Optimizations** (proactive) — a hand-curated backlog under
+  `optimizations/`. Each `*.json` file describes an improvement you want made
+  to NEXT_HARNESS (a feature, refactor, hardening, telemetry, …). See
+  `optimizations/README.md` for the format. This is how the pipeline builds
+  *additions*, not just fixes. Once shipped, an optimization's signature
+  (`opt::<id>`) is recorded in the ledger so it isn't rebuilt on the next run.
+
+## Merging PRs
+
+By default this pipeline **opens** PRs and leaves merging to a human review.
+To let it merge too, pass `--auto-merge` (or set `REMEDIATE_AUTO_MERGE=1`);
+the merge method defaults to `squash` and is overridable with
+`--merge-method`. Auto-merge still respects the target repo's branch
+protection and required checks — if those block it, the PR simply stays open
+for manual merge.
 
 ## Remediation ledger
 
@@ -57,11 +81,20 @@ again — that usually means the fix didn't actually address the root cause.
 ```bash
 npm install
 cp .env.local.example .env.local   # fill in MCP_ENDPOINT_URL
-npm run report
+npm run report                                     # read-only health picture
+npm run remediate -- --dry-run                     # see the agent prompt, no changes
+npm run remediate                                  # fix + open PR(s)
+npm run remediate -- --auto-merge                  # …and merge them
 ```
 
 ## Keeping it running
 
-This is meant to run on a recurring schedule, not just once. See
-`docs/RUNBOOK.md` for how the recurring Claude Code Remote trigger is set up
-and what it does on each fire.
+This is meant to run on a recurring schedule, not just once. The simplest
+setup is the included **GitHub Actions workflow** (`.github/workflows/llm-ops.yml`):
+a scheduled read-only report every 6 hours, plus a gated remediation run you
+can trigger manually (or on the same schedule) that opens/merges PRs into
+NEXT_HARNESS. It needs a handful of repository secrets — `MCP_ENDPOINT_URL`,
+`ANTHROPIC_API_KEY`, and a `GH_PAT` with push/PR rights on NEXT_HARNESS.
+
+If you'd rather run it on a box (EC2, cron) instead of CI, see
+`docs/RUNBOOK.md`.

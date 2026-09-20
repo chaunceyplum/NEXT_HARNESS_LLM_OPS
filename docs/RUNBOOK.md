@@ -1,4 +1,18 @@
-# Runbook: running the remediation pipeline on EC2
+# Runbook: running the remediation pipeline
+
+There are two supported ways to run this on a schedule:
+
+- **GitHub Actions (recommended, no server needed)** — `.github/workflows/llm-ops.yml`
+  runs the report every 6 hours and lets you dispatch a remediation run
+  (`Actions → LLM-Ops → Run workflow`, tick *remediate* and optionally
+  *auto-merge*). CI runners are non-root, so the Claude Code root-permission
+  restriction described below doesn't apply there. Set these repository
+  secrets: `MCP_ENDPOINT_URL`, `MCP_API_KEY` (if your gateway enforces auth),
+  `ANTHROPIC_API_KEY`, and `GH_PAT` (push + PR rights on NEXT_HARNESS).
+  Optionally set repository *variables* `TARGET_REPO` and `TARGET_BASE_BRANCH`.
+- **A box (EC2 / cron)** — described below, for when you'd rather not use CI.
+
+## EC2 / cron setup
 
 This mirrors `NEXT_HARNESS/DEPLOYMENT_GUIDE.md`'s "Option B: AWS EC2" setup —
 same instance family/OS is fine, and if NEXT_HARNESS is already running on an
@@ -65,10 +79,15 @@ to run otherwise rather than risk clobbering in-progress work.
 ## Running it
 
 ```bash
-npm run report                                  # read-only — see current findings
+npm run report                                  # read-only — findings + pending optimizations
 npm run remediate -- --dry-run                  # see the prompt it would send, no changes
 npm run remediate                                # the real thing: fix, commit, push, open/update PR
+npm run remediate -- --auto-merge                # …and merge the PR (squash by default)
 ```
+
+`remediate` acts on both auto-diagnosed failure findings and any pending
+items in the `optimizations/` backlog. Merging is opt-in: `--auto-merge`
+(or `REMEDIATE_AUTO_MERGE=1`), method via `--merge-method squash|merge|rebase`.
 
 ## Scheduling
 

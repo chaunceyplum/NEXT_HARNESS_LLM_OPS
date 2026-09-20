@@ -1,0 +1,133 @@
+name: LLM-Ops
+
+# Keeps the pipeline running without an EC2 box or cron: a scheduled
+# read-only health report, plus a gated remediation run that actually opens
+# (and optionally merges) PRs into the target repo.
+#
+# Required repository secrets:
+#   MCP_ENDPOINT_URL    - same MCP endpoint NEXT_HARNESS uses (for live data)
+#   MCP_API_KEY         - optional, if the MCP API Gateway stage enforces auth
+#   ANTHROPIC_API_KEY   - auth for the headless `claude` CLI (remediate only)
+#   GH_PAT              - PAT with push + pull-request rights on the target repo
+# Optional repository variables (Settings -> Variables):
+#   TARGET_REPO         - owner/name of the repo to fix (default: chaunceyplum/NEXT_HARNESS)
+#   TARGET_BASE_BRANCH  - base branch for PRs (default: main)
+
+on:
+  schedule:
+    # Every 6 hours — matches the cadence suggested in docs/RUNBOOK.md.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      remediate:
+        description: 'Run remediation (open/refresh PRs), not just the report'
+        type: boolean
+        default: false
+      auto_merge:
+        description: 'Auto-merge the resulting PR (requires branch protection to allow it)'
+        type: boolean
+        default: false
+
+# Lets the "Commit updated ledger" step push the ledger back to this repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: llm-ops-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_REPO: ${{ vars.TARGET_REPO || 'chaunceyplum/NEXT_HARNESS' }}
+  TARGET_BASE_BRANCH: ${{ vars.TARGET_BASE_BRANCH || 'main' }}
+  # Branch in the target repo that fixes are pushed to.
+  TARGET_BRANCH: llm-ops/automated-fixes
+
+jobs:
+  report:
+    name: Health report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Generate report
+        env:
+          MCP_ENDPOINT_URL: ${{ secrets.MCP_ENDPOINT_URL }}
+          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+        run: |
+          if [ -z "$MCP_ENDPOINT_URL" ]; then
+            echo "MCP_ENDPOINT_URL secret not set — skipping live report." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          npm run report >> "$GITHUB_STEP_SUMMARY"
+
+  remediate:
+    name: Remediate + PR
+    runs-on: ubuntu-latest
+    # Only on explicit dispatch with remediate=true, or on the schedule.
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.remediate)
+    steps:
+      - name: Checkout ops repo
+        uses: actions/checkout@v4
+        with:
+          path: ops
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: target
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install ops deps
+        working-directory: ops
+        run: npm ci
+
+      - name: Install Claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Prepare target branch
+        working-directory: target
+        run: |
+          git config user.name "llm-ops[bot]"
+          git config user.email "llm-ops@users.noreply.github.com"
+          git checkout -B "$TARGET_BRANCH"
+
+      - name: Run remediation
+        working-directory: ops
+        env:
+          MCP_ENDPOINT_URL: ${{ secrets.MCP_ENDPOINT_URL }}
+          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          NEXT_HARNESS_PATH: ${{ github.workspace }}/target
+          NEXT_HARNESS_BRANCH: ${{ env.TARGET_BRANCH }}
+          NEXT_HARNESS_BASE_BRANCH: ${{ env.TARGET_BASE_BRANCH }}
+          # Fall back to the committed fixture when no live endpoint is configured,
+          # so a scheduled run still exercises the pipeline instead of erroring.
+          SEED_ARG: ${{ secrets.MCP_ENDPOINT_URL == '' && '--seed scripts/fixtures/2026-09-01-failed-runs.json' || '' }}
+          AUTO_MERGE_ARG: ${{ (github.event_name == 'workflow_dispatch' && inputs.auto_merge) && '--auto-merge' || '' }}
+        run: npm run remediate -- $SEED_ARG $AUTO_MERGE_ARG
+
+      - name: Commit updated ledger
+        working-directory: ops
+        run: |
+          if ! git diff --quiet remediation-ledger.json; then
+            git config user.name "llm-ops[bot]"
+            git config user.email "llm-ops@users.noreply.github.com"
+            git add remediation-ledger.json
+            git commit -m "chore: update remediation ledger [skip ci]"
+            git push
+          else
+            echo "No ledger changes to commit."
+          fi
