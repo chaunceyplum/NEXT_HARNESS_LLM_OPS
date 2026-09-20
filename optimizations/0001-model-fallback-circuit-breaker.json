@@ -1,0 +1,7 @@
+{
+  "id": "model-fallback-circuit-breaker",
+  "title": "Add a model-health circuit breaker with same-tier fallback",
+  "rationale": "The live harness_agent_runs data shows nearly every failure is a provider access/auth/quota error against a single model, with no automatic fallback — one unhealthy model takes down otherwise-valid runs. A circuit breaker that marks a model unhealthy after repeated provider errors and retries an unpinned request against the next healthy same-tier model would eliminate the largest failure class instead of just reporting it.",
+  "details": "Implement in NEXT_HARNESS's model routing layer (lib/llm/model-registry.ts + lib/llm/agent.ts per the repo's own structure). Track recent provider_access/provider_auth/provider_quota failures per model; when a threshold is crossed, mark the model unhealthy for a cooldown window and route unpinned requests to the next healthy model in the same cost/quality tier. Do NOT silently swallow errors for explicitly pinned models — surface them. Add vitest coverage matching existing conventions.",
+  "priority": "high"
+}
