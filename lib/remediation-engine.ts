@@ -140,7 +140,7 @@ const SYSTEM_PROMPT = [
   '- Make the smallest change that correctly addresses the task. Several findings may share one root cause; prefer one coherent fix over many scattered patches.',
   '- Where an issue is really an account/infrastructure problem no code can fix (e.g. a cloud provider model-access grant), document it in the appropriate place rather than inventing a code workaround.',
   '- Add or update tests next to the code you change, matching the repo\'s existing conventions.',
-  '- Before finishing, run the repo\'s test command (and lint if it has one) via run_bash and fix anything you broke.',
+  '- Before finishing, run the same checks the repo\'s CI runs on a pull request (read .github/workflows/ to find them — typically typecheck, lint, tests and build) via run_bash, and fix anything you broke. A PR that fails those checks cannot merge. If dependencies are not installed (no node_modules), install them first with the repo\'s lockfile command (e.g. npm ci).',
   '- Then stage and commit your work with run_bash (git add + git commit) using a clear message. Do NOT push and do NOT open a pull request — that is handled for you after you finish.',
   '- Stay strictly scoped to the task. Do not refactor unrelated code.',
   '',

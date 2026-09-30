@@ -8,7 +8,7 @@ import { loadEnvLocal } from '../lib/load-env';
 loadEnvLocal();
 
 import { loadConfig } from '../lib/config';
-import { buildFindings, loadLedger, newFindings } from '../lib/diagnose';
+import { buildFindings, countNonActionable, loadLedger, newFindings } from '../lib/diagnose';
 import { loadOptimizations, optimizationSignature, pendingOptimizations } from '../lib/optimizations';
 import { fetchFailedRuns, fetchRunTotals } from '../lib/runs-repository';
 
@@ -30,6 +30,8 @@ async function main() {
   lines.push(`Generated ${new Date().toISOString()}`);
   lines.push('');
   lines.push(`- Runs: ${totals.total} total, ${totals.failed} failed (${rate}%)`);
+  const stopped = countNonActionable(failedRuns);
+  if (stopped > 0) lines.push(`- Of the failed runs, ${stopped} were stopped on purpose (cancel / kill switch) and are not findings`);
   lines.push(`- Findings: ${findings.length} (${unresolved.length} not yet remediated)`);
   lines.push(`- Optimizations: ${optimizations.length} in backlog (${pendingOpts.length} pending)`);
   lines.push('');

@@ -38,3 +38,29 @@ describe('classifyError', () => {
     expect(classifyError(message)).toBe(expected);
   });
 });
+
+// Error strings NEXT_HARNESS writes since durable runs, the kill switch,
+// request timeouts and model routing (Sep 2026), taken from the harness
+// source (lib/build-run.ts, lib/kill-switch.ts, app/api/runs/[id]/cancel,
+// lib/fetch-timeout.ts, lib/mcp-client.ts, lib/llm/model-registry.ts).
+describe('classifyError — newer harness failure messages', () => {
+  it.each([
+    ['Stopped by alice@example.com.', 'cancelled'],
+    ['Stopped by the kill switch (ops@example.com: incident 42).', 'cancelled'],
+    // A kill-switch reason is free text; it must not be read as a provider error.
+    ['Stopped by the kill switch (ops: Bedrock Forbidden everywhere).', 'cancelled'],
+    ['Cancelled', 'cancelled'],
+    ['MCP call failed: Error: MCP tool adobe_list_segments timed out after 60s (timeout)', 'timeout'],
+    ['MCP call failed: Error: MCP Error [-32000]: tool execution failed', 'tool_failure'],
+    ['MCP call failed: TypeError: fetch failed', 'tool_failure'],
+    ['Unknown model key "anthropic:sonnet-9". Available: bedrock:balanced, anthropic:haiku', 'config'],
+    ['MCP_ENDPOINT_URL is not set. Please configure it in .env.local', 'config'],
+    [
+      '[chat model call (bedrock:balanced)] Forbidden\n(Not falling back to "bedrock:balanced-2": the failed attempt ' +
+        'on "bedrock:balanced" already executed write/destructive tool calls, which a restarted run would repeat.)',
+      'provider_access',
+    ],
+  ] as const)('classifies %j as %s', (message, expected) => {
+    expect(classifyError(message)).toBe(expected);
+  });
+});
