@@ -22,6 +22,14 @@ export interface TargetConfig {
   optimizationsDir: string;
   /** Budget ceiling handed to the headless coding agent, in USD. */
   maxBudgetUsd: string;
+  /** Table holding one row per eval invocation (see lib/evals-repository.ts). */
+  evalRunsTable: string;
+  /** Table holding one row per eval fixture trial. */
+  evalResultsTable: string;
+  /** Path to the committed regression floor, resolved relative to repoPath. */
+  baselinePath: string;
+  /** Eval suites to gate on. First cut defaults to just the agent suite. */
+  evalSuites: string[];
 }
 
 export function loadConfig(): TargetConfig {
@@ -32,5 +40,12 @@ export function loadConfig(): TargetConfig {
     base: process.env.NEXT_HARNESS_BASE_BRANCH || 'main',
     optimizationsDir: process.env.OPTIMIZATIONS_DIR || 'optimizations',
     maxBudgetUsd: process.env.REMEDIATE_MAX_BUDGET_USD || '3',
+    evalRunsTable: process.env.HARNESS_EVAL_RUNS_TABLE || 'harness_eval_runs',
+    evalResultsTable: process.env.HARNESS_EVAL_RESULTS_TABLE || 'harness_eval_results',
+    baselinePath: process.env.HARNESS_EVAL_BASELINE_PATH || 'evals/baseline.json',
+    evalSuites: (process.env.HARNESS_EVAL_SUITES || 'agent')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
   };
 }

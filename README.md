@@ -39,8 +39,9 @@ by someone running ad hoc SQL.
 4. **Report** — `npm run report` prints the current findings, pending
    optimizations, and ledger status as markdown. Run it any time to see the
    health picture.
-5. **Remediate** — for each new/unremediated finding *and* each pending
-   optimization (see below), a coding agent is driven against the
+5. **Remediate** — for each new/unremediated failure finding, pending
+   optimization, *and* eval regression (see below), a coding agent is driven
+   against the
    NEXT_HARNESS repo with the work item as its task: make the change, open a
    PR, and update the ledger with the PR link. By default it opens PRs for
    review and stops there; auto-merge is opt-in (`--auto-merge`). This step is
@@ -67,19 +68,31 @@ The engine only edits and commits; pushing, opening the PR, and the optional
 merge are always owned by `scripts/remediate.ts` so they stay deterministic
 and auditable.
 
-## Two kinds of work item
+## Three kinds of work item
 
-This pipeline acts on two inputs, both flowing through the same
+This pipeline acts on three inputs, all flowing through the same
 agent → commit → push → PR → ledger machinery:
 
 - **Failure findings** (reactive) — auto-diagnosed from `harness_agent_runs`,
-  as described above.
+  as described above. Signature `<model>::<category>`.
 - **Optimizations** (proactive) — a hand-curated backlog under
   `optimizations/`. Each `*.json` file describes an improvement you want made
   to NEXT_HARNESS (a feature, refactor, hardening, telemetry, …). See
   `optimizations/README.md` for the format. This is how the pipeline builds
   *additions*, not just fixes. Once shipped, an optimization's signature
   (`opt::<id>`) is recorded in the ledger so it isn't rebuilt on the next run.
+- **Eval findings** (reactive) — quality/safety regressions diagnosed from
+  NEXT_HARNESS's own eval tables (`harness_eval_runs` / `harness_eval_results`,
+  read through the same `execute_sql` bridge) compared against the committed
+  regression floor in `NEXT_HARNESS/evals/baseline.json`. When a suite's latest
+  eval run falls below its success/reliability floor, or shows any safety
+  violation, an eval finding (signature `eval::<suite>::<metric>`) is raised.
+  These are **PR-only**: they open a PR and are recorded in the ledger, but are
+  never auto-merged even with `--auto-merge`, because a quality/safety fix needs
+  a human review. First cut gates the `agent` suite on
+  success/reliability/safety; see
+  [`docs/DESIGN-consume-harness-evals.md`](docs/DESIGN-consume-harness-evals.md)
+  for the full design and the `HARNESS_EVAL_*` config knobs.
 
 ## Merging PRs
 

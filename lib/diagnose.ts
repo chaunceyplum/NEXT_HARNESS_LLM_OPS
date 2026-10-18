@@ -138,7 +138,10 @@ export function saveLedger(ledger: Ledger, path: string = DEFAULT_LEDGER_PATH): 
  * fix landed (lastSeen after remediatedAt) — the latter means the fix
  * didn't address the root cause and the finding needs attention again.
  */
-export function newFindings(findings: Finding[], ledger: Ledger): Finding[] {
+export function newFindings<T extends { signature: string; lastSeen: string }>(
+  findings: T[],
+  ledger: Ledger
+): T[] {
   return findings.filter((finding) => {
     const entry = ledger[finding.signature];
     if (!entry) return true;
