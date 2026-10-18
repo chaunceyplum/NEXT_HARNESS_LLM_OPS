@@ -55,11 +55,22 @@ by someone running ad hoc SQL.
 
 The fix step runs a **self-contained, in-process engine**
 (`lib/remediation-engine.ts`): an agentic tool-use loop that talks directly to
-the Anthropic API and edits a local NEXT_HARNESS checkout through a small,
-sandboxed tool set (read/write files, list dirs, run the repo's own
-tests/lint/git — all confined to the repo root). It needs only an
-`ANTHROPIC_API_KEY` — **no external `claude` CLI to install**, which is what
-lets it run fully autonomously in CI or on any host.
+the Anthropic API (`@anthropic-ai/sdk`, default model `claude-opus-5-5`,
+override with `REMEDIATE_ENGINE_MODEL`) and edits a local NEXT_HARNESS checkout
+through a small tool set: read/write files and list dirs (paths confined to the
+repo root) and run shell commands (for the repo's own tests/lint/git). It needs
+only an `ANTHROPIC_API_KEY` — **no external `claude` CLI to install**, which is
+what lets it run fully autonomously in CI or on any host.
+
+Guards, not a security sandbox — the shell tool is an ordinary shell as the
+host user: it runs with credentials (tokens, API keys, secrets) stripped from
+its environment and git's persisted GitHub auth header blanked, and `git push`
+is refused, so the model can't push or call GitHub/Anthropic with the
+pipeline's credentials; the run stops at `maxSteps` (40), a token cap
+(`REMEDIATE_MAX_TOKENS`, default 3M) and an estimated-spend cap
+(`REMEDIATE_MAX_BUDGET_USD`, default $3); a turn cut off at the output limit
+never runs its tool calls; and a refusal stops the run. If the engine leaves
+uncommitted changes, nothing is pushed.
 
 Engine selection:
 
@@ -112,9 +123,16 @@ before the merge is attempted.
 
 ## Remediation ledger
 
-`remediation-ledger.json` tracks `signature -> { prUrl, remediatedAt }`.
-A finding that recurs *after* its `remediatedAt` timestamp is treated as new
-again — that usually means the fix didn't actually address the root cause.
+`remediation-ledger.json` tracks `signature -> { prUrl, remediatedAt }`. An
+item is recorded when its PR is **opened** (not merged), so a failed merge
+can't make the next run redo the work. A finding that recurs *after* its
+`remediatedAt` timestamp is treated as new again — that usually means the fix
+didn't address the root cause — unless its PR is still open, in which case the
+fix just hasn't landed yet and it isn't re-filed.
+
+Every run works on one fix branch (`llm-ops/automated-fixes`). While its PR is
+open, a run builds on top of it; once that PR has merged or closed, the next
+run starts fresh from the base branch and replaces the stale remote branch.
 
 ## Running it
 

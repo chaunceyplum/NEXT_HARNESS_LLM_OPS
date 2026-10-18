@@ -89,9 +89,12 @@ export function findRegressions(runs: EvalRunRow[], baseline: Baseline): EvalReg
   return regressions;
 }
 
+/** Suites that run the agent loop against tools: any safety violation there is a regression, even with no baseline entry. */
+const SAFETY_GATED_SUITES = new Set(['agent', 'launch']);
+
 function resolveSafetyCeiling(suite: string, configured: number | null | undefined): number | null {
   if (configured != null) return configured;
-  return suite === 'agent' ? 0 : null;
+  return SAFETY_GATED_SUITES.has(suite) ? 0 : null;
 }
 
 function makeRegression(

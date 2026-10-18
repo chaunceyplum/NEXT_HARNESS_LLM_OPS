@@ -65,6 +65,7 @@ import {
 import { findRegressions, loadBaseline } from '../lib/baseline';
 import { buildEvalFindings, type EvalFinding } from '../lib/diagnose-evals';
 import { runRemediationEngine } from '../lib/remediation-engine';
+import { ledgerPrUrls, parsePrUrl, prCarriesEvalFix, withoutOpenPrItems } from '../lib/pr-state';
 import { mergeOrQueue, type MergeMethod } from '../lib/pr-merge';
 
 type Engine = 'in-process' | 'claude-cli';
@@ -262,8 +263,13 @@ async function runAgent(prompt: string, opts: Options): Promise<void> {
     return;
   }
   console.log('Engine: in-process (Anthropic API, no external CLI).');
-  const result = await runRemediationEngine({ repoPath: opts.repoPath, prompt });
-  console.log(`Engine finished in ${result.steps} step(s); wrote ${result.filesWritten.length} file(s).`);
+  const result = await runRemediationEngine({ repoPath: opts.repoPath, prompt, maxBudgetUsd: Number(opts.maxBudgetUsd) });
+  console.log(
+    `Engine finished in ${result.steps} step(s); wrote ${result.filesWritten.length} file(s); ` +
+      `${result.totalTokens} tokens` +
+      (result.estimatedCostUsd !== undefined ? ` (~$${result.estimatedCostUsd.toFixed(2)})` : '') +
+      '.'
+  );
   if (result.finalText) console.log(`\nEngine summary:\n${result.finalText}\n`);
 }
 
@@ -290,7 +296,15 @@ function assertCleanCheckout(repoPath: string, branch: string): void {
 
 function hasNewCommits(repoPath: string, branch: string): boolean {
   const status = execFileSync('git', ['status', '--porcelain'], { cwd: repoPath }).toString().trim();
-  if (status) return true; // uncommitted changes claude left behind count as work done
+  if (status) {
+    // Only commits are pushed. Uncommitted changes mean the agent didn't
+    // finish (or skipped its checks) — refuse rather than open a PR without
+    // them and ledger the work as done.
+    throw new Error(
+      `The coding agent left uncommitted changes in ${repoPath} — it did not finish its work. ` +
+        `Refusing to push/PR partial work:\n${status}`
+    );
+  }
   try {
     const ahead = execFileSync('git', ['rev-list', '--count', `origin/${branch}..${branch}`], { cwd: repoPath })
       .toString()
@@ -301,8 +315,34 @@ function hasNewCommits(repoPath: string, branch: string): boolean {
   }
 }
 
-function gitPush(repoPath: string, branch: string): void {
-  execFileSync('git', ['push', '-u', 'origin', branch], { cwd: repoPath, stdio: 'inherit' });
+/**
+ * Push the fix branch. When it continues an open PR it's a fast-forward; when
+ * there is no open PR, any remote copy of the branch is left over from an
+ * earlier PR that merged or closed, so it's replaced (--force-with-lease, so a
+ * concurrent push is never clobbered) instead of the push being rejected.
+ */
+function gitPush(repoPath: string, branch: string, replaceStale: boolean): void {
+  const args = ['push', '-u', ...(replaceStale ? ['--force-with-lease'] : []), 'origin', branch];
+  execFileSync('git', args, { cwd: repoPath, stdio: 'inherit' });
+}
+
+/** Continue an open PR: put the local fix branch at the PR's remote head (the checkout is asserted clean). */
+function syncToRemoteBranch(repoPath: string, branch: string): void {
+  execFileSync('git', ['fetch', 'origin', branch], { cwd: repoPath, stdio: 'inherit' });
+  execFileSync('git', ['checkout', '-B', branch, `origin/${branch}`], { cwd: repoPath, stdio: 'inherit' });
+}
+
+/** Which of these PR urls are still open (unknown/unreadable ones count as not open). */
+async function openPrUrls(urls: string[]): Promise<Set<string>> {
+  const open = new Set<string>();
+  if (!(process.env.GITHUB_TOKEN || process.env.GH_TOKEN)) return open;
+  for (const url of urls) {
+    const pr = parsePrUrl(url);
+    if (!pr) continue;
+    const response = await githubRequest(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`);
+    if (response.ok && ((await response.json()) as { state?: string }).state === 'open') open.add(url);
+  }
+  return open;
 }
 
 function parseOwnerRepo(repoPath: string): { owner: string; repo: string } {
@@ -397,13 +437,25 @@ async function main() {
 
   const failedRuns = await loadFailedRuns(opts);
   const findings = buildFindings(failedRuns);
-  const unresolvedFindings = newFindings(findings, ledger);
+  let unresolvedFindings = newFindings(findings, ledger);
 
   const optimizations = loadOptimizations(opts.optimizationsDir);
   const pendingOpts = pendingOptimizations(optimizations, ledger);
 
   // Third work-item stream: eval regressions vs the committed baseline floor.
-  const unresolvedEvalFindings = await loadEvalFindings(opts, ledger);
+  let unresolvedEvalFindings = await loadEvalFindings(opts, ledger);
+
+  // A finding can recur while its fix PR is still open (ledgered on PR open,
+  // not merge) — don't re-file it onto that PR every run.
+  const recurring = [...unresolvedFindings, ...unresolvedEvalFindings].map((f) => f.signature);
+  const stillOpen = await openPrUrls(ledgerPrUrls(recurring, ledger));
+  if (stillOpen.size > 0) {
+    const before = unresolvedFindings.length + unresolvedEvalFindings.length;
+    unresolvedFindings = withoutOpenPrItems(unresolvedFindings, (f) => f.signature, ledger, stillOpen);
+    unresolvedEvalFindings = withoutOpenPrItems(unresolvedEvalFindings, (f) => f.signature, ledger, stillOpen);
+    const skipped = before - unresolvedFindings.length - unresolvedEvalFindings.length;
+    if (skipped > 0) console.log(`Skipping ${skipped} recurring finding(s) whose fix PR is still open: ${[...stillOpen].join(', ')}`);
+  }
 
   const workItems: WorkItem[] = [
     ...unresolvedFindings.map((f) => ({ signature: f.signature, summary: `${f.signature} (${f.count} occurrences)` })),
@@ -436,16 +488,23 @@ async function main() {
 
   warnIfRoot(opts.engine);
   assertCleanCheckout(opts.repoPath, opts.branch);
+
+  // Every run uses one fix branch. If its PR is still open, build on top of it;
+  // otherwise start from the base (the caller's checkout) and replace any
+  // stale remote copy of the branch on push.
+  const { owner, repo } = parseOwnerRepo(opts.repoPath);
+  const existingPr = await findOpenPullRequest(owner, repo, opts.branch);
+  if (existingPr) syncToRemoteBranch(opts.repoPath, opts.branch);
+
   await runAgent(prompt, opts);
 
   if (!hasNewCommits(opts.repoPath, opts.branch)) {
-    throw new Error('The coding agent finished but left no new commits and no uncommitted changes — nothing to push.');
+    throw new Error('The coding agent finished but left no new commits — nothing to push.');
   }
 
-  gitPush(opts.repoPath, opts.branch);
+  gitPush(opts.repoPath, opts.branch, !existingPr);
 
-  const { owner, repo } = parseOwnerRepo(opts.repoPath);
-  let pr = await findOpenPullRequest(owner, repo, opts.branch);
+  let pr = existingPr;
   if (!pr) {
     pr = await openPullRequest({
       owner,
@@ -474,10 +533,12 @@ async function main() {
   // (quality/safety) regression, do NOT auto-merge even if --auto-merge is
   // set — those fixes carry more behavioral risk than config fixes, so a human
   // reviews them in the first cut.
-  if (opts.autoMerge && unresolvedEvalFindings.length > 0) {
+  // The PR may also carry an eval fix from an EARLIER run (same branch/PR), so
+  // check the ledger for this PR too, not just this batch.
+  if (opts.autoMerge && (unresolvedEvalFindings.length > 0 || prCarriesEvalFix(pr.html_url, ledger))) {
     console.log(
-      `Skipping auto-merge: ${unresolvedEvalFindings.length} eval (quality/safety) regression(s) in this batch ` +
-        `are PR-only and must be merged by a human. PR left open: ${pr.html_url}`
+      `Skipping auto-merge: PR ${pr.html_url} carries eval (quality/safety) fix(es), which are PR-only and ` +
+        `must be merged by a human.`
     );
   } else if (opts.autoMerge) {
     const outcome = await mergeOrQueue(githubRequest, { owner, repo, number: pr.number, nodeId: pr.node_id }, opts.mergeMethod);
