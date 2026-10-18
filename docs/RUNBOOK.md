@@ -65,9 +65,32 @@ npm run remediate                                # the real thing: fix, commit, 
 npm run remediate -- --auto-merge                # …and merge the PR (squash by default)
 ```
 
-`remediate` acts on both auto-diagnosed failure findings and any pending
-items in the `optimizations/` backlog. Merging is opt-in: `--auto-merge`
-(or `REMEDIATE_AUTO_MERGE=1`), method via `--merge-method squash|merge|rebase`.
+`remediate` acts on three streams: auto-diagnosed failure findings, any pending
+items in the `optimizations/` backlog, and **eval regressions** diagnosed from
+NEXT_HARNESS's eval tables vs its committed `evals/baseline.json`. Merging is
+opt-in: `--auto-merge` (or `REMEDIATE_AUTO_MERGE=1`), method via
+`--merge-method squash|merge|rebase`. **Eval findings are PR-only**: when a run
+contains any eval (quality/safety) regression, that PR is left open for a human
+to review even if `--auto-merge` is set — only the failure-finding /
+optimization work items are eligible for auto-merge.
+
+### Eval-gate configuration (`HARNESS_EVAL_*`)
+
+The eval stream reads NEXT_HARNESS's eval history and regression floor. All of
+these have NEXT_HARNESS-shaped defaults, so no setup is needed for the standard
+layout:
+
+- `HARNESS_EVAL_RUNS_TABLE` — eval runs table (default `harness_eval_runs`).
+- `HARNESS_EVAL_RESULTS_TABLE` — per-trial results table (default
+  `harness_eval_results`).
+- `HARNESS_EVAL_BASELINE_PATH` — regression floor, resolved relative to the
+  local NEXT_HARNESS checkout at `NEXT_HARNESS_PATH` (default
+  `evals/baseline.json`).
+- `HARNESS_EVAL_SUITES` — comma-separated suites to gate on (default `agent`).
+
+A `null` threshold in `baseline.json` is not checked; the safety ceiling is held
+at zero, so any safety violation in the latest run of a gated suite is a
+regression.
 
 ## Scheduling
 

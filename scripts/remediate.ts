@@ -1,11 +1,17 @@
 /**
  * `npm run remediate` — the actual change-and-PR step of the pipeline.
  *
- * It acts on two kinds of work item, both flowing through the same
+ * It acts on three kinds of work item, all flowing through the same
  * agent -> commit -> push -> PR -> ledger machinery:
  *   1. Failure findings   — auto-diagnosed from harness_agent_runs (reactive).
  *   2. Optimizations      — a hand-curated backlog under optimizations/ that
  *                           describes improvements to build (proactive).
+ *   3. Eval findings      — quality/safety regressions diagnosed from
+ *                           harness_eval_runs/_results vs the committed
+ *                           baseline.json (reactive). PR-ONLY: these open a PR
+ *                           and are recorded in the ledger, but are never
+ *                           auto-merged even when --auto-merge is set, since a
+ *                           quality/safety fix needs a human review.
  *
  * Steps:
  * 1. Load new/unresolved findings (live from harness_agent_runs by default,
@@ -51,6 +57,13 @@ import {
   type Optimization,
 } from '../lib/optimizations';
 import { fetchFailedRuns, type FailedRun } from '../lib/runs-repository';
+import {
+  fetchFailingTrials,
+  fetchLatestEvalRuns,
+  type EvalFailingTrial,
+} from '../lib/evals-repository';
+import { findRegressions, loadBaseline } from '../lib/baseline';
+import { buildEvalFindings, type EvalFinding } from '../lib/diagnose-evals';
 import { runRemediationEngine } from '../lib/remediation-engine';
 
 type Engine = 'in-process' | 'claude-cli';
@@ -109,6 +122,27 @@ async function loadFailedRuns(opts: Options): Promise<FailedRun[]> {
   return fetchFailedRuns();
 }
 
+/**
+ * The eval-finding stream: latest run per suite -> baseline comparison ->
+ * findings, filtered by the ledger's recurrence rule (same newFindings as the
+ * failure findings). Live-only (needs the MCP bridge), so it is skipped in a
+ * seeded/offline run where failure findings came from --seed.
+ */
+async function loadEvalFindings(opts: Options, ledger: ReturnType<typeof loadLedger>): Promise<EvalFinding[]> {
+  if (opts.seedPath) return []; // seeded offline run: no live bridge for eval tables
+  const evalRuns = await fetchLatestEvalRuns({ suites: loadConfig().evalSuites });
+  const regressions = findRegressions(evalRuns, loadBaseline(opts.repoPath));
+  const regressingRunIds = [...new Set(regressions.map((r) => r.evalRunId))];
+  const failingTrials = await fetchFailingTrials(regressingRunIds);
+  const trialsByRun = new Map<string, EvalFailingTrial[]>();
+  for (const t of failingTrials) {
+    const list = trialsByRun.get(t.evalRunId) ?? [];
+    list.push(t);
+    trialsByRun.set(t.evalRunId, list);
+  }
+  return newFindings(buildEvalFindings(regressions, trialsByRun), ledger);
+}
+
 function findingSection(f: Finding): string {
   return [
     `### ${f.signature}`,
@@ -130,7 +164,18 @@ function optimizationSection(o: Optimization): string {
   ].join('\n');
 }
 
-function buildPrompt(findings: Finding[], optimizations: Optimization[]): string {
+function evalFindingSection(f: EvalFinding): string {
+  return [
+    `### ${f.signature} — ${f.suite}/${f.subject}`,
+    `- Metric: ${f.metric} (observed ${f.observed}, breached threshold ${f.threshold})`,
+    `- Regressions collapsed: ${f.count} (first seen ${f.firstSeen}, last seen ${f.lastSeen})`,
+    `- Sample fixture notes:`,
+    ...(f.sampleErrors.length > 0 ? f.sampleErrors.map((e) => `  - ${e}`) : ['  - (none recorded)']),
+    `- Suggested fix direction: ${f.suggestedFix}`,
+  ].join('\n');
+}
+
+function buildPrompt(findings: Finding[], optimizations: Optimization[], evalFindings: EvalFinding[]): string {
   const lines: string[] = [
     'You are improving the reliability and capability of this repo (the target agent app). Some work items ' +
       'below are failure patterns diagnosed from the app\'s own execution history table (harness_agent_runs); ' +
@@ -145,6 +190,18 @@ function buildPrompt(findings: Finding[], optimizations: Optimization[]): string
   if (optimizations.length > 0) {
     lines.push('## Optimizations to implement', '');
     for (const o of optimizations) lines.push(optimizationSection(o), '');
+  }
+  if (evalFindings.length > 0) {
+    lines.push(
+      '## Eval regressions to fix (quality/safety)',
+      '',
+      'These are regressions where the latest eval run for a suite breached its committed baseline floor in ' +
+        'NEXT_HARNESS/evals/baseline.json (or showed a safety violation). Treat safety regressions as the ' +
+        'highest priority. Use the sample fixture notes to find what the agent is now getting wrong, and fix ' +
+        'the underlying prompt/model/tool behavior — do not just move the baseline.',
+      ''
+    );
+    for (const f of evalFindings) lines.push(evalFindingSection(f), '');
   }
 
   lines.push(
@@ -316,7 +373,7 @@ async function mergePullRequest(
   }
 }
 
-function prBody(findings: Finding[], optimizations: Optimization[]): string {
+function prBody(findings: Finding[], optimizations: Optimization[], evalFindings: EvalFinding[]): string {
   const lines = [
     'Opened by NEXT_HARNESS_LLM_OPS (`scripts/remediate.ts`) from work items diagnosed against the live ' +
       '`harness_agent_runs` table and/or the optimization backlog.',
@@ -332,6 +389,16 @@ function prBody(findings: Finding[], optimizations: Optimization[]): string {
   if (optimizations.length > 0) {
     lines.push('Optimizations implemented:', '');
     for (const o of optimizations) lines.push(`- \`${optimizationSignature(o)}\` — ${o.title}`);
+    lines.push('');
+  }
+  if (evalFindings.length > 0) {
+    lines.push('Eval regressions addressed (quality/safety — PR-only, not auto-merged):', '');
+    for (const f of evalFindings) {
+      lines.push(
+        `- \`${f.signature}\` — ${f.suite}/${f.subject}, ${f.metric} ${f.observed} vs ${f.threshold} ` +
+          `(${f.count} regression(s), ${f.firstSeen} to ${f.lastSeen})`
+      );
+    }
     lines.push('');
   }
   lines.push('---', '_Generated by [Claude Code](https://claude.ai/code)_');
@@ -350,9 +417,16 @@ async function main() {
   const optimizations = loadOptimizations(opts.optimizationsDir);
   const pendingOpts = pendingOptimizations(optimizations, ledger);
 
+  // Third work-item stream: eval regressions vs the committed baseline floor.
+  const unresolvedEvalFindings = await loadEvalFindings(opts, ledger);
+
   const workItems: WorkItem[] = [
     ...unresolvedFindings.map((f) => ({ signature: f.signature, summary: `${f.signature} (${f.count} occurrences)` })),
     ...pendingOpts.map((o) => ({ signature: optimizationSignature(o), summary: `${optimizationSignature(o)} — ${o.title}` })),
+    ...unresolvedEvalFindings.map((f) => ({
+      signature: f.signature,
+      summary: `${f.signature} — ${f.suite}/${f.subject} ${f.metric} ${f.observed} vs ${f.threshold}`,
+    })),
   ];
 
   if (workItems.length === 0) {
@@ -363,7 +437,7 @@ async function main() {
   console.log(`${workItems.length} work item(s) to act on:`);
   for (const w of workItems) console.log(`  - ${w.summary}`);
 
-  const prompt = buildPrompt(unresolvedFindings, pendingOpts);
+  const prompt = buildPrompt(unresolvedFindings, pendingOpts, unresolvedEvalFindings);
 
   if (opts.dryRun) {
     console.log(`\n--dry-run: would drive the "${opts.engine}" engine with this prompt and stop here:\n`);
@@ -394,14 +468,24 @@ async function main() {
       branch: opts.branch,
       base: opts.base,
       title: 'LLM-Ops: fix reliability findings and implement backlog optimizations',
-      body: prBody(unresolvedFindings, pendingOpts),
+      body: prBody(unresolvedFindings, pendingOpts, unresolvedEvalFindings),
     });
     console.log(`Opened PR #${pr.number}: ${pr.html_url}`);
   } else {
     console.log(`Pushed to existing PR #${pr.number}: ${pr.html_url}`);
   }
 
-  if (opts.autoMerge) {
+  // PR-only posture for eval findings: when the batch contains any eval
+  // (quality/safety) regression, do NOT auto-merge even if --auto-merge is
+  // set — those fixes carry more behavioral risk than config fixes, so a human
+  // reviews them in the first cut. (The eval signatures are still ledgered
+  // below on PR open, exactly like the other work items.)
+  if (opts.autoMerge && unresolvedEvalFindings.length > 0) {
+    console.log(
+      `Skipping auto-merge: ${unresolvedEvalFindings.length} eval (quality/safety) regression(s) in this batch ` +
+        `are PR-only and must be merged by a human. PR left open: ${pr.html_url}`
+    );
+  } else if (opts.autoMerge) {
     await mergePullRequest(owner, repo, pr.number, opts.mergeMethod);
     console.log(`Merged PR #${pr.number} (${opts.mergeMethod}).`);
   }
