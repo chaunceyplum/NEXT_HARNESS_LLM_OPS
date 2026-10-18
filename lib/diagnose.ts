@@ -7,7 +7,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { classifyError, type ErrorCategory } from './error-classification';
+import { classifyError, NON_ACTIONABLE_CATEGORIES, type ErrorCategory } from './error-classification';
 import type { FailedRun } from './runs-repository';
 
 export interface Finding {
@@ -27,6 +27,11 @@ export interface LedgerEntry {
 }
 
 export type Ledger = Record<string, LedgerEntry>;
+
+/** How many failed runs were deliberate stops (cancel, kill switch) rather than defects. */
+export function countNonActionable(failedRuns: FailedRun[]): number {
+  return failedRuns.filter((run) => NON_ACTIONABLE_CATEGORIES.has(classifyError(run.error))).length;
+}
 
 export function findingSignature(model: string, category: ErrorCategory): string {
   return `${model}::${category}`;
@@ -60,6 +65,20 @@ function suggestFix(model: string, category: ErrorCategory): string {
         `re-enters the agent loop's context (lib/llm/agent.ts / lib/llm/tool-catalog.ts), extending the existing ` +
         `RAG-result capping pattern to tool results generally.`
       );
+    case 'timeout':
+      return (
+        `Runs on "${model}" are failing because a request hit its deadline. Recommended fix: check which call timed ` +
+        `out in the sample errors (MCP tool, embedding provider, or chat model). If it's one slow MCP tool, raise its ` +
+        `timeout (MCP_TOOL_TIMEOUT_MS / lib/fetch-timeout.ts) or make it retryable; if it's widespread, the MCP ` +
+        `endpoint or provider is degraded and the fix is operational, not code.`
+      );
+    case 'config':
+      return (
+        `Runs on "${model}" are failing on a harness configuration error (unknown model key, unsupported provider, ` +
+        `or missing MCP endpoint). Recommended fix: validate this at startup or request validation ` +
+        `(app/api/build/route.ts / lib/llm/model-registry.ts) so a bad key is rejected with a 400 instead of ` +
+        `starting a run that can only fail; fix the deployment's env vars if that's the cause.`
+      );
     case 'tool_failure':
       return (
         `A specific MCP tool call failed independent of the chat model provider. Recommended fix: inspect the ` +
@@ -85,6 +104,7 @@ export function buildFindings(failedRuns: FailedRun[]): Finding[] {
 
   for (const run of failedRuns) {
     const category = classifyError(run.error);
+    if (NON_ACTIONABLE_CATEGORIES.has(category)) continue;
     const signature = findingSignature(run.model, category);
     const existing = groups.get(signature);
 

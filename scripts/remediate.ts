@@ -65,6 +65,7 @@ import {
 import { findRegressions, loadBaseline } from '../lib/baseline';
 import { buildEvalFindings, type EvalFinding } from '../lib/diagnose-evals';
 import { runRemediationEngine } from '../lib/remediation-engine';
+import { mergeOrQueue, type MergeMethod } from '../lib/pr-merge';
 
 type Engine = 'in-process' | 'claude-cli';
 
@@ -77,7 +78,7 @@ interface Options {
   maxBudgetUsd: string;
   dryRun: boolean;
   autoMerge: boolean;
-  mergeMethod: 'squash' | 'merge' | 'rebase';
+  mergeMethod: MergeMethod;
   engine: Engine;
 }
 
@@ -216,7 +217,8 @@ function buildPrompt(findings: Finding[], optimizations: Optimization[], evalFin
     '- For optimizations, implement the described change scoped to its rationale; if it turns out to be a bad ' +
       'idea once you see the code, leave a note explaining why rather than forcing it.',
     '- Add or update tests covering each change, matching this repo\'s existing conventions.',
-    '- Run this repo\'s lint and test commands and fix any failures before you finish.',
+    '- Before you finish, run every check this repo\'s CI runs on a pull request (see .github/workflows/ — ' +
+      'e.g. typecheck, lint, tests, build) and fix any failures; the PR cannot merge until they pass.',
     '- Commit your changes with clear, descriptive messages (you may make more than one commit).',
     '- Do not push and do not open a pull request yourself — the calling script handles that after you finish.',
     '- Stay scoped to these work items. Do not refactor or fix unrelated things you notice along the way.'
@@ -328,6 +330,7 @@ async function githubRequest(path: string, init: RequestInit = {}): Promise<Resp
 interface PullRequest {
   number: number;
   html_url: string;
+  node_id: string;
 }
 
 async function findOpenPullRequest(owner: string, repo: string, branch: string): Promise<PullRequest | null> {
@@ -353,24 +356,6 @@ async function openPullRequest(opts: {
     throw new Error(`Failed to open PR: HTTP ${response.status} ${await response.text().catch(() => '')}`);
   }
   return (await response.json()) as PullRequest;
-}
-
-async function mergePullRequest(
-  owner: string,
-  repo: string,
-  prNumber: number,
-  method: Options['mergeMethod']
-): Promise<void> {
-  const response = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
-    method: 'PUT',
-    body: JSON.stringify({ merge_method: method }),
-  });
-  if (!response.ok) {
-    throw new Error(
-      `Failed to merge PR #${prNumber}: HTTP ${response.status} ${await response.text().catch(() => '')} ` +
-        `(branch protection, required checks, or conflicts can block auto-merge — the PR is still open for manual merge).`
-    );
-  }
 }
 
 function prBody(findings: Finding[], optimizations: Optimization[], evalFindings: EvalFinding[]): string {
@@ -475,27 +460,41 @@ async function main() {
     console.log(`Pushed to existing PR #${pr.number}: ${pr.html_url}`);
   }
 
-  // PR-only posture for eval findings: when the batch contains any eval
-  // (quality/safety) regression, do NOT auto-merge even if --auto-merge is
-  // set — those fixes carry more behavioral risk than config fixes, so a human
-  // reviews them in the first cut. (The eval signatures are still ledgered
-  // below on PR open, exactly like the other work items.)
-  if (opts.autoMerge && unresolvedEvalFindings.length > 0) {
-    console.log(
-      `Skipping auto-merge: ${unresolvedEvalFindings.length} eval (quality/safety) regression(s) in this batch ` +
-        `are PR-only and must be merged by a human. PR left open: ${pr.html_url}`
-    );
-  } else if (opts.autoMerge) {
-    await mergePullRequest(owner, repo, pr.number, opts.mergeMethod);
-    console.log(`Merged PR #${pr.number} (${opts.mergeMethod}).`);
-  }
-
+  // Record the PR before merging: the work is shipped once the PR exists, and
+  // a merge that fails must not leave the ledger unaware of it (the next run
+  // would otherwise redo the same work and push it again).
   const remediatedAt = new Date().toISOString();
   for (const item of workItems) {
     ledger[item.signature] = { prUrl: pr.html_url, remediatedAt };
   }
   saveLedger(ledger);
   console.log(`Ledger updated with ${workItems.length} work item(s).`);
+
+  // PR-only posture for eval findings: when the batch contains any eval
+  // (quality/safety) regression, do NOT auto-merge even if --auto-merge is
+  // set — those fixes carry more behavioral risk than config fixes, so a human
+  // reviews them in the first cut.
+  if (opts.autoMerge && unresolvedEvalFindings.length > 0) {
+    console.log(
+      `Skipping auto-merge: ${unresolvedEvalFindings.length} eval (quality/safety) regression(s) in this batch ` +
+        `are PR-only and must be merged by a human. PR left open: ${pr.html_url}`
+    );
+  } else if (opts.autoMerge) {
+    const outcome = await mergeOrQueue(githubRequest, { owner, repo, number: pr.number, nodeId: pr.node_id }, opts.mergeMethod);
+    if (outcome.kind === 'merged') {
+      console.log(`Merged PR #${pr.number} (${opts.mergeMethod}).`);
+    } else if (outcome.kind === 'auto-merge-queued') {
+      console.log(
+        `PR #${pr.number} can't merge yet (${outcome.mergeError}); queued GitHub auto-merge (${opts.mergeMethod}), ` +
+          `so it merges once required checks pass.`
+      );
+    } else {
+      console.warn(
+        `PR #${pr.number} left open for manual merge. Merge refused: ${outcome.mergeError}. ` +
+          `Auto-merge not queued: ${outcome.autoMergeError} (enable "Allow auto-merge" in the target repo's settings).`
+      );
+    }
+  }
 }
 
 main().catch((err) => {

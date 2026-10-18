@@ -30,7 +30,10 @@ by someone running ad hoc SQL.
    `NEXT_HARNESS/ARCHITECTURE.md`).
 2. **Classify** — `lib/error-classification.ts` buckets each failure's error
    message into a category (`provider_auth`, `provider_access`,
-   `provider_quota`, `context_length`, `tool_failure`, `unknown`).
+   `provider_quota`, `context_length`, `timeout`, `config`, `tool_failure`,
+   `unknown`). Runs someone stopped on purpose (cancel, kill switch) are
+   classified `cancelled` and left out of findings: NEXT_HARNESS saves them
+   with status `failed`, but they aren't defects.
 3. **Diagnose** — `lib/diagnose.ts` groups classified failures into stable
    *findings* (one per `model` + `category` signature, with counts and
    sample errors), and checks `remediation-ledger.json` to see which
@@ -100,8 +103,12 @@ By default this pipeline **opens** PRs and leaves merging to a human review.
 To let it merge too, pass `--auto-merge` (or set `REMEDIATE_AUTO_MERGE=1`);
 the merge method defaults to `squash` and is overridable with
 `--merge-method`. Auto-merge still respects the target repo's branch
-protection and required checks — if those block it, the PR simply stays open
-for manual merge.
+protection and required checks. When required checks are still pending (the
+usual case, since NEXT_HARNESS runs CI on every PR), the pipeline queues
+GitHub's native auto-merge so the PR merges once they pass; that needs "Allow
+auto-merge" turned on in the target repo's settings. If it can't be queued, the
+PR simply stays open for manual merge. Either way the ledger records the PR
+before the merge is attempted.
 
 ## Remediation ledger
 

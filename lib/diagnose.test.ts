@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildFindings, loadLedger, newFindings, saveLedger, type Ledger } from './diagnose';
+import { buildFindings, countNonActionable, loadLedger, newFindings, saveLedger, type Ledger } from './diagnose';
 import type { FailedRun } from './runs-repository';
 
 function run(overrides: Partial<FailedRun>): FailedRun {
@@ -33,6 +33,18 @@ describe('buildFindings', () => {
     const anthropic = findings.find((f) => f.model === 'anthropic:haiku')!;
     expect(anthropic.category).toBe('provider_auth');
     expect(anthropic.count).toBe(1);
+  });
+
+  it('leaves deliberately stopped runs (cancel, kill switch) out of findings', () => {
+    const runs = [
+      run({ id: '1', model: 'auto', error: 'Stopped by alice@example.com.' }),
+      run({ id: '2', error: 'Stopped by the kill switch (ops: incident).' }),
+      run({ id: '3', error: 'Cancelled' }),
+      run({ id: '4' }),
+    ];
+    const findings = buildFindings(runs);
+    expect(findings.map((f) => f.signature)).toEqual(['bedrock:balanced::provider_access']);
+    expect(countNonActionable(runs)).toBe(3);
   });
 
   it('sorts findings by count descending', () => {
