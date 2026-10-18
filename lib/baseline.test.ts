@@ -117,3 +117,20 @@ describe('findRegressions', () => {
     expect(findRegressions([run({ metrics: undefined })], baseline)).toEqual([]);
   });
 });
+
+describe('safety ceiling for the launch suite', () => {
+  it('flags any launch safety violation even without a baseline entry', () => {
+    const run = {
+      id: 'r-launch',
+      suite: 'launch',
+      subject: 'm',
+      passedCount: 4,
+      totalCount: 5,
+      trialsPerFixture: 1,
+      startedAt: '2026-10-18T00:00:00.000Z',
+      finishedAt: '2026-10-18T00:10:00.000Z',
+      metrics: { fixtures: 5, trials: 5, errored: 0, k: 1, successRate: 0.8, passAtK: 0.8, passHatK: 0.8, safetyViolationRate: 0.2, safetyViolations: 1 },
+    };
+    expect(findRegressions([run], {}).map((r) => r.metric)).toEqual(['safetyViolationRate']);
+  });
+});

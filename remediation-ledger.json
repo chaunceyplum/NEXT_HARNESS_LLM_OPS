@@ -30,5 +30,13 @@
   "anthropic:opus::provider_quota": {
     "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/40",
     "remediatedAt": "2026-09-20T16:32:00.000Z"
+  },
+  "anthropic:haiku::context_length": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS/pull/66",
+    "remediatedAt": "2026-10-17T00:00:00.000Z"
+  },
+  "opt::consume-harness-evals": {
+    "prUrl": "https://github.com/chaunceyplum/NEXT_HARNESS_LLM_OPS/pull/3",
+    "remediatedAt": "2026-10-18T00:00:00.000Z"
   }
 }

@@ -15,8 +15,10 @@ There are two supported ways to run this on a schedule:
 
 By default the fix step runs the **self-contained in-process engine**
 (`lib/remediation-engine.ts`) — an agentic loop against the Anthropic API that
-edits the target checkout through a sandboxed tool set (read/write/list/bash,
-all confined to the repo root). It needs only an `ANTHROPIC_API_KEY`; there is
+edits the target checkout through read/write/list tools confined to the repo
+root plus a shell tool (credentials stripped from its environment, `git push`
+refused — guards, not a security sandbox), with step, token and spend caps
+(`REMEDIATE_MAX_TOKENS`, `REMEDIATE_MAX_BUDGET_USD`). It needs only an `ANTHROPIC_API_KEY`; there is
 **no external CLI to install and no non-root requirement** — it runs fine in
 CI or as any user.
 
@@ -70,9 +72,12 @@ items in the `optimizations/` backlog, and **eval regressions** diagnosed from
 NEXT_HARNESS's eval tables vs its committed `evals/baseline.json`. Merging is
 opt-in: `--auto-merge` (or `REMEDIATE_AUTO_MERGE=1`), method via
 `--merge-method squash|merge|rebase`. **Eval findings are PR-only**: when a run
-contains any eval (quality/safety) regression, that PR is left open for a human
-to review even if `--auto-merge` is set — only the failure-finding /
-optimization work items are eligible for auto-merge.
+contains any eval (quality/safety) regression — or the PR it pushes to already
+carries one from an earlier run — that PR is left open for a human to review
+even if `--auto-merge` is set. Only PRs carrying nothing but failure-finding /
+optimization work items are eligible for auto-merge. Eval suites read by
+default: `agent,launch` (`HARNESS_EVAL_SUITES`); any safety violation in either
+is a regression.
 
 ### Eval-gate configuration (`HARNESS_EVAL_*`)
 

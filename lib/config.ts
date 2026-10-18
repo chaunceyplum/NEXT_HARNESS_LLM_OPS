@@ -36,14 +36,14 @@ export function loadConfig(): TargetConfig {
   return {
     runsTable: process.env.HARNESS_RUNS_TABLE || 'harness_agent_runs',
     repoPath: process.env.NEXT_HARNESS_PATH || '../NEXT_HARNESS',
-    branch: process.env.NEXT_HARNESS_BRANCH || 'claude/llm-ops-pipeline-plan-23aa8s',
+    branch: process.env.NEXT_HARNESS_BRANCH || 'llm-ops/automated-fixes',
     base: process.env.NEXT_HARNESS_BASE_BRANCH || 'main',
     optimizationsDir: process.env.OPTIMIZATIONS_DIR || 'optimizations',
     maxBudgetUsd: process.env.REMEDIATE_MAX_BUDGET_USD || '3',
     evalRunsTable: process.env.HARNESS_EVAL_RUNS_TABLE || 'harness_eval_runs',
     evalResultsTable: process.env.HARNESS_EVAL_RESULTS_TABLE || 'harness_eval_results',
     baselinePath: process.env.HARNESS_EVAL_BASELINE_PATH || 'evals/baseline.json',
-    evalSuites: (process.env.HARNESS_EVAL_SUITES || 'agent')
+    evalSuites: (process.env.HARNESS_EVAL_SUITES || 'agent,launch')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),

@@ -8,40 +8,63 @@
  * that reason.
  *
  * This engine removes that dependency. It drives an agentic tool-use loop
- * directly against the Anthropic Messages API over `fetch` (no SDK, no CLI),
- * giving the model a small, sandboxed set of tools scoped to a single target
- * repo checkout: read a file, write a file, list a directory, and run a
- * shell command (for grep/tests/git). The only requirement is an
+ * against the Anthropic Messages API (via @anthropic-ai/sdk — no external
+ * CLI), giving the model a small set of tools scoped to a single target repo
+ * checkout: read a file, write a file, list a directory, and run a shell
+ * command (for grep/tests/git). The only requirement is an
  * `ANTHROPIC_API_KEY` and network access to the API — both of which a normal
  * CI runner or deploy host has.
  *
- * It is deliberately conservative:
- * - All file paths are resolved and confined to the target repo root; an
- *   attempt to escape it is refused, not silently allowed.
- * - Shell commands run with the repo as cwd and a hard timeout.
- * - There is a hard cap on the number of model round-trips (`maxSteps`) so a
- *   confused run can't loop forever burning tokens.
+ * Guards (these limit mistakes; they are NOT a security sandbox — run_bash is
+ * an arbitrary shell as the host user):
+ * - read_file / write_file / list_directory resolve paths and refuse anything
+ *   outside the target repo root.
+ * - run_bash runs with the repo as cwd, a hard timeout, and an environment
+ *   scrubbed of credentials (API keys, tokens, secrets) with git's persisted
+ *   GitHub auth header blanked, and it refuses `git push` — so the model can't
+ *   push or reach GitHub/Anthropic with the pipeline's credentials by
+ *   accident. It can still read any file the host user can.
+ * - Hard caps on model round-trips (`maxSteps`), total tokens
+ *   (`maxTotalTokens`) and estimated spend (`maxBudgetUsd`).
+ * - A turn cut off at max_tokens never runs its (possibly truncated) tool
+ *   calls; a refusal stops the run.
  * - It only edits files and runs commands. It does NOT push, open PRs, or
  *   merge — the calling script (scripts/remediate.ts) owns those steps so
  *   they stay deterministic and auditable.
  */
 
+import Anthropic from '@anthropic-ai/sdk';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { resolve, relative, dirname, isAbsolute } from 'node:path';
 
-const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
-const ANTHROPIC_VERSION = '2023-06-01';
+/** Default engine model; REMEDIATE_ENGINE_MODEL overrides. */
+export const DEFAULT_ENGINE_MODEL = 'claude-opus-5-5';
+
+/** Per-MTok USD prices used for the budget guard ([input, output]). Unknown models are guarded by tokens only. */
+const PRICES_PER_MTOK: Record<string, [number, number]> = {
+  'claude-opus-5-5': [4, 20],
+  'claude-sonnet-5-5': [2, 10],
+  'claude-haiku-5-5': [0.1, 0.5],
+  'claude-fable-5-1': [10, 50],
+};
+
+/** Cap on a read_file result, so one huge file can't fill the context. */
+const MAX_READ_CHARS = 200_000;
 
 export interface EngineOptions {
   /** Absolute path to the target repo checkout the engine may edit. */
   repoPath: string;
   /** The task/prompt describing what to change. */
   prompt: string;
-  /** Anthropic model id. Defaults to a current Sonnet. */
+  /** Anthropic model id. Defaults to REMEDIATE_ENGINE_MODEL, then DEFAULT_ENGINE_MODEL. */
   model?: string;
   /** Max model round-trips before the loop is force-stopped. */
   maxSteps?: number;
+  /** Stop once estimated spend (input + output, at PRICES_PER_MTOK) exceeds this many USD. */
+  maxBudgetUsd?: number;
+  /** Stop once total billed tokens (input incl. cache + output) exceed this. */
+  maxTotalTokens?: number;
   /** Per-shell-command timeout in ms. */
   commandTimeoutMs?: number;
   /** Sink for progress logs (defaults to console.log). */
@@ -59,28 +82,10 @@ export interface EngineResult {
   steps: number;
   /** Relative paths of files the engine wrote. */
   filesWritten: string[];
-}
-
-interface AnthropicToolUseBlock {
-  type: 'tool_use';
-  id: string;
-  name: string;
-  input: Record<string, unknown>;
-}
-interface AnthropicTextBlock {
-  type: 'text';
-  text: string;
-}
-type AnthropicContentBlock = AnthropicToolUseBlock | AnthropicTextBlock;
-
-interface AnthropicMessage {
-  role: 'user' | 'assistant';
-  content: string | AnthropicContentBlock[] | Array<Record<string, unknown>>;
-}
-
-interface AnthropicResponse {
-  content: AnthropicContentBlock[];
-  stop_reason: string;
+  /** Total tokens billed across the run (input incl. cache + output). */
+  totalTokens: number;
+  /** Estimated USD spend, when the model's price is known. */
+  estimatedCostUsd?: number;
 }
 
 const TOOLS = [
@@ -127,7 +132,7 @@ const TOOLS = [
       required: ['command'],
     },
   },
-] as const;
+] satisfies Anthropic.Beta.BetaTool[];
 
 const SYSTEM_PROMPT = [
   'You are an autonomous software engineer operating directly inside a git checkout of a target repository.',
@@ -140,7 +145,7 @@ const SYSTEM_PROMPT = [
   '- Make the smallest change that correctly addresses the task. Several findings may share one root cause; prefer one coherent fix over many scattered patches.',
   '- Where an issue is really an account/infrastructure problem no code can fix (e.g. a cloud provider model-access grant), document it in the appropriate place rather than inventing a code workaround.',
   '- Add or update tests next to the code you change, matching the repo\'s existing conventions.',
-  '- Before finishing, run the repo\'s test command (and lint if it has one) via run_bash and fix anything you broke.',
+  '- Before finishing, run the same checks the repo\'s CI runs on a pull request (read .github/workflows/ to find them — typically typecheck, lint, tests and build) via run_bash, and fix anything you broke. A PR that fails those checks cannot merge. If dependencies are not installed (no node_modules), install them first with the repo\'s lockfile command (e.g. npm ci).',
   '- Then stage and commit your work with run_bash (git add + git commit) using a clear message. Do NOT push and do NOT open a pull request — that is handled for you after you finish.',
   '- Stay strictly scoped to the task. Do not refactor unrelated code.',
   '',
@@ -165,7 +170,12 @@ function toolReadFile(repoRoot: string, input: Record<string, unknown>): string 
     return `ERROR: ${err instanceof Error ? err.message : String(err)}`;
   }
   if (!existsSync(abs)) return `ERROR: file does not exist: ${input.path}`;
-  return readFileSync(abs, 'utf-8');
+  const text = readFileSync(abs, 'utf-8');
+  if (text.length <= MAX_READ_CHARS) return text;
+  return (
+    text.slice(0, MAX_READ_CHARS) +
+    `\n\n[truncated: file is ${text.length} chars; showing the first ${MAX_READ_CHARS}. Use run_bash (sed -n, grep) to read the rest.]`
+  );
 }
 
 function toolWriteFile(repoRoot: string, input: Record<string, unknown>, written: Set<string>): string {
@@ -196,10 +206,37 @@ function toolListDirectory(repoRoot: string, input: Record<string, unknown>): st
     .join('\n');
 }
 
+/** Env var names that hold credentials the model's shell must not inherit. */
+const SECRET_ENV_RE = /(TOKEN|SECRET|PASSWORD|API_KEY|_KEY$|^GH_|^GITHUB_|^ANTHROPIC_|^MCP_|^AWS_)/i;
+
+/**
+ * The environment run_bash runs with: the host env minus credentials, plus a
+ * git config override that blanks the GitHub auth header actions/checkout
+ * persists into the checkout's .git/config — so `git`/`curl` in the model's
+ * shell can't reach GitHub with the pipeline's token.
+ */
+export function scrubbedEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!SECRET_ENV_RE.test(k)) out[k] = v;
+  }
+  out.GIT_CONFIG_COUNT = '1';
+  out.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
+  out.GIT_CONFIG_VALUE_0 = '';
+  out.GIT_TERMINAL_PROMPT = '0';
+  return out;
+}
+
+const GIT_PUSH_RE = /\bgit\b[^\n;&|]*\bpush\b/;
+
 function toolRunBash(repoRoot: string, input: Record<string, unknown>, timeoutMs: number): string {
   const command = String(input.command);
+  if (GIT_PUSH_RE.test(command)) {
+    return 'ERROR: git push is not allowed here — commit locally; the calling script pushes and opens the PR.';
+  }
   try {
     const out = execFileSync('bash', ['-lc', command], {
+      env: scrubbedEnv(),
       cwd: repoRoot,
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
@@ -233,14 +270,34 @@ export function dispatchTool(
   }
 }
 
-/** Drive the agentic loop to completion. Throws on API/auth errors. */
+/** Estimated USD for a usage block at the model's list price, or undefined when the price is unknown. */
+function costOf(model: string, usage: Anthropic.Beta.BetaUsage): number | undefined {
+  const price = PRICES_PER_MTOK[model];
+  if (!price) return undefined;
+  const [inPrice, outPrice] = price;
+  const input =
+    usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) * 1.25 + (usage.cache_read_input_tokens ?? 0) * 0.1;
+  return (input * inPrice + usage.output_tokens * outPrice) / 1_000_000;
+}
+
+function tokensOf(usage: Anthropic.Beta.BetaUsage): number {
+  return (
+    usage.input_tokens +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0) +
+    usage.output_tokens
+  );
+}
+
+/** Drive the agentic loop to completion. Throws on API/auth errors, refusals, and exhausted limits. */
 export async function runRemediationEngine(opts: EngineOptions): Promise<EngineResult> {
   const repoRoot = resolve(opts.repoPath);
-  const model = opts.model || process.env.REMEDIATE_ENGINE_MODEL || 'claude-sonnet-4-5-20250929';
+  const model = opts.model || process.env.REMEDIATE_ENGINE_MODEL || DEFAULT_ENGINE_MODEL;
   const maxSteps = opts.maxSteps ?? 40;
+  const maxBudgetUsd = opts.maxBudgetUsd ?? Number(process.env.REMEDIATE_MAX_BUDGET_USD || 3);
+  const maxTotalTokens = opts.maxTotalTokens ?? Number(process.env.REMEDIATE_MAX_TOKENS || 3_000_000);
   const commandTimeoutMs = opts.commandTimeoutMs ?? 300_000;
   const log = opts.log ?? ((m: string) => console.log(m));
-  const doFetch = opts.fetchImpl ?? fetch;
   const apiKey = opts.apiKey ?? process.env.ANTHROPIC_API_KEY;
 
   if (!apiKey) {
@@ -250,54 +307,100 @@ export async function runRemediationEngine(opts: EngineOptions): Promise<EngineR
     );
   }
 
+  const client = new Anthropic({ apiKey, ...(opts.fetchImpl ? { fetch: opts.fetchImpl } : {}) });
   const written = new Set<string>();
-  const messages: AnthropicMessage[] = [{ role: 'user', content: opts.prompt }];
+  const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: 'user', content: opts.prompt }];
 
   let finalText = '';
-  let step = 0;
+  let totalTokens = 0;
+  let costUsd: number | undefined = PRICES_PER_MTOK[model] ? 0 : undefined;
+  const result = (steps: number): EngineResult => ({
+    finalText,
+    steps,
+    filesWritten: [...written],
+    totalTokens,
+    estimatedCostUsd: costUsd,
+  });
 
-  for (; step < maxSteps; step++) {
-    const response = await doFetch(ANTHROPIC_API_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify({
+  for (let step = 0; step < maxSteps; step++) {
+    let response: Anthropic.Beta.BetaMessage;
+    try {
+      response = await client.beta.messages.create({
         model,
-        max_tokens: 8192,
+        max_tokens: 16_000,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
         messages,
-      }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Anthropic API error: HTTP ${response.status} ${response.statusText} — ${body.slice(0, 500)}`);
+        // The system prompt + tools are identical every turn and the history
+        // only grows, so caching the prefix makes each later turn far cheaper.
+        cache_control: { type: 'ephemeral' },
+        output_config: { effort: 'high' },
+        // Re-run a safety-classifier refusal on a fallback model instead of
+        // stopping the remediation outright.
+        betas: ['server-side-fallback-2026-07-01'],
+        fallbacks: 'default',
+      });
+    } catch (err) {
+      if (err instanceof Anthropic.APIError) {
+        throw new Error(`Anthropic API error: HTTP ${err.status ?? '?'} — ${err.message.slice(0, 500)}`);
+      }
+      throw err;
     }
 
-    const data = (await response.json()) as AnthropicResponse;
-    messages.push({ role: 'assistant', content: data.content });
+    totalTokens += tokensOf(response.usage);
+    const stepCost = costOf(model, response.usage);
+    if (costUsd !== undefined && stepCost !== undefined) costUsd += stepCost;
 
-    const textParts = data.content.filter((b): b is AnthropicTextBlock => b.type === 'text');
-    if (textParts.length > 0) {
-      finalText = textParts.map((t) => t.text).join('\n');
+    // Keep the full content (thinking blocks included) so history stays append-only.
+    messages.push({ role: 'assistant', content: response.content });
+
+    const textParts = response.content.filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === 'text');
+    if (textParts.length > 0) finalText = textParts.map((t) => t.text).join('\n');
+    const toolUses = response.content.filter((b): b is Anthropic.Beta.BetaToolUseBlock => b.type === 'tool_use');
+
+    if (response.stop_reason === 'refusal') {
+      throw new Error(
+        `The model declined to continue (refusal${response.stop_details?.category ? `: ${response.stop_details.category}` : ''}). ` +
+          `Partial work may have been written (${written.size} file(s)); it was not committed by the engine.`
+      );
     }
 
-    const toolUses = data.content.filter((b): b is AnthropicToolUseBlock => b.type === 'tool_use');
+    if (totalTokens > maxTotalTokens || (costUsd !== undefined && costUsd > maxBudgetUsd)) {
+      throw new Error(
+        `Remediation engine stopped at its budget (${totalTokens} tokens` +
+          (costUsd !== undefined ? `, ~$${costUsd.toFixed(2)} of $${maxBudgetUsd}` : '') +
+          `). Partial work may have been written (${written.size} file(s)); it was not committed by the engine.`
+      );
+    }
 
-    if (data.stop_reason !== 'tool_use' || toolUses.length === 0) {
-      // Model is done.
-      return { finalText, steps: step + 1, filesWritten: [...written] };
+    if (response.stop_reason === 'max_tokens') {
+      // The turn was cut off: any tool call in it may carry a truncated input
+      // (e.g. half a file), so none of them run. Each still needs a
+      // tool_result; tell the model what happened so it retries smaller.
+      const truncated = 'Your previous response hit the output limit and was cut off, so this call was NOT run. ' +
+        'Retry it with less output per call (write large files in smaller pieces, or edit with run_bash).';
+      messages.push({
+        role: 'user',
+        content: toolUses.length
+          ? toolUses.map((tu) => ({ type: 'tool_result' as const, tool_use_id: tu.id, content: truncated, is_error: true }))
+          : 'Your previous response hit the output limit and was cut off. Continue from where you stopped.',
+      });
+      continue;
+    }
+
+    if (response.stop_reason === 'pause_turn') {
+      continue; // server paused a long turn; resend to resume
+    }
+
+    if (response.stop_reason !== 'tool_use' || toolUses.length === 0) {
+      return result(step + 1);
     }
 
     const toolResults = toolUses.map((tu) => {
       log(`  → ${tu.name}(${JSON.stringify(tu.input).slice(0, 120)})`);
       let content: string;
       try {
-        content = dispatchTool(tu.name, tu.input, { repoRoot, written, commandTimeoutMs });
+        content = dispatchTool(tu.name, tu.input as Record<string, unknown>, { repoRoot, written, commandTimeoutMs });
       } catch (err) {
         content = `ERROR: ${err instanceof Error ? err.message : String(err)}`;
       }

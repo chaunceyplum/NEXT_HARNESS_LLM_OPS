@@ -85,13 +85,21 @@ jobs:
           path: target
           fetch-depth: 0
 
+      # Node 22 matches the target repo's own CI (NEXT_HARNESS .github/workflows/ci.yml).
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install ops deps
         working-directory: ops
         run: npm ci
+
+      # The engine runs the target's typecheck/lint/test/build before it
+      # commits; without the target's dependencies installed it can't, and
+      # its PR would first find out at the target's required CI checks.
+      - name: Install target deps
+        working-directory: target
+        run: npm ci --no-audit --no-fund
 
       # No external CLI to install: the default in-process remediation engine
       # talks directly to the Anthropic API using ANTHROPIC_API_KEY below.
